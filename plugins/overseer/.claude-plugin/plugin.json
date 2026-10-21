@@ -1,0 +1,21 @@
+{
+  "name": "overseer",
+  "version": "0.2.0",
+  "description": "Watch and steer every subagent: live model and effort, change them mid-run, message running or finished agents, and run Codex as a steerable subagent.",
+  "author": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
+  "license": "MIT",
+  "repository": "https://github.com/rohit3a/overseer",
+  "keywords": ["subagents", "codex", "monitor", "control"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpenPane": { "type": "boolean", "title": "Open the Agents pane on the first subagent", "description": "Opens the pane beside the chat when a subagent starts. It never takes focus.", "default": true },
+    "informParent": { "type": "boolean", "title": "Tell Claude about your messages", "description": "When you message a subagent, add a note to the main conversation so Claude trusts what the subagent reports.", "default": true },
+    "autoRevive": { "type": "boolean", "title": "Revive agents a bad override broke", "description": "If a model override fails a request, drop the override and tell the agent to continue.", "default": true },
+    "redirectCodexBash": { "type": "boolean", "title": "Send Codex runs through Overseer", "description": "Refuse raw `codex exec` shell commands and point Claude at the Overseer Codex tool, so you can watch and steer them.", "default": true },
+    "codexSandbox": { "type": "string", "title": "Codex access", "description": "What Codex may do when Overseer runs it.", "default": "danger-full-access", "options": ["danger-full-access", "workspace-write", "read-only"] },
+    "codexPath": { "type": "string", "title": "Codex executable", "description": "Absolute path to codex. Empty finds it automatically.", "default": "" },
+    "spawnReview": { "type": "boolean", "title": "Review subagent prompts before they start", "description": "Hold each new subagent until you approve, edit or deny its prompt in the pane.", "default": false },
+    "spawnReviewTimeoutSec": { "type": "number", "title": "Spawn review timeout (seconds)", "description": "An unanswered review approves itself after this long, so unattended runs never hang.", "default": 90 },
+    "historyDays": { "type": "number", "title": "Days of agent history to keep", "description": "Finished agents from earlier sessions, shown under History.", "default": 7 }
+  }
+}

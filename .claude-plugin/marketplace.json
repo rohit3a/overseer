@@ -1,0 +1,19 @@
+{
+  "name": "overseer",
+  "owner": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
+  "plugins": [
+    {
+      "name": "overseer",
+      "source": "./plugins/overseer",
+      "description": "Watch and steer every subagent: model, effort, messages, Codex."
+    },
+    {
+      "name": "overseer-courier",
+      "source": "./plugins/overseer-courier",
+      "description": "Delivers Overseer's messages to subagents (required by overseer)."
+    }
+  ],
+  "metadata": {
+    "description": "Overseer: watch and steer Claude Code subagents and Codex from a live pane."
+  }
+}

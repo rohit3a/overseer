@@ -1,0 +1,10 @@
+{
+  "name": "overseer-courier",
+  "version": "0.2.0",
+  "description": "Delivers Overseer's messages to subagents from its own frame, so Overseer keeps seeing agents it resumes.",
+  "author": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
+  "license": "MIT",
+  "repository": "https://github.com/rohit3a/overseer",
+  "types": "./types/index.d.ts",
+  "dependencies": ["overseer"]
+}
