@@ -1,6 +1,6 @@
 {
   "name": "overseer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Watch and steer every subagent: live model and effort, change them mid-run, message running or finished agents, and run Codex as a steerable subagent.",
   "author": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
   "license": "MIT",
@@ -13,6 +13,7 @@
     "autoRevive": { "type": "boolean", "title": "Revive agents a bad override broke", "description": "If a model override fails a request, drop the override and tell the agent to continue.", "default": true },
     "redirectCodexBash": { "type": "boolean", "title": "Send Codex runs through Overseer", "description": "Refuse raw `codex exec` shell commands and point Claude at the Overseer Codex tool, so you can watch and steer them.", "default": true },
     "codexSandbox": { "type": "string", "title": "Codex access", "description": "What Codex may do when Overseer runs it.", "default": "danger-full-access", "options": ["danger-full-access", "workspace-write", "read-only"] },
+    "codexFast": { "type": "boolean", "title": "Codex fast mode", "description": "Run Codex agents on Codex's fast tier (faster, uses more of your plan). Off keeps your Codex config's speed.", "default": false },
     "codexPath": { "type": "string", "title": "Codex executable", "description": "Absolute path to codex. Empty finds it automatically.", "default": "" },
     "spawnReview": { "type": "boolean", "title": "Review subagent prompts before they start", "description": "Hold each new subagent until you approve, edit or deny its prompt in the pane.", "default": false },
     "spawnReviewTimeoutSec": { "type": "number", "title": "Spawn review timeout (seconds)", "description": "An unanswered review approves itself after this long, so unattended runs never hang.", "default": 90 },

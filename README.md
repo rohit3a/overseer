@@ -92,7 +92,7 @@ In an open card:
 
 Overseer gives Claude a tool, `mcp__overseer__codex`. Ask Claude to delegate to Codex and it uses that tool. A raw `codex exec` in a shell is refused, and Claude is pointed at that tool instead, so you can always see and steer the run. The check catches the usual forms (`codex exec`, a full path, `npx`, `env`, `sudo`, flags before `exec`) but not every way of hiding a command; it keeps Claude on the tool, not a determined script.
 
-Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread. Codex runs with **full access** by default (`danger-full-access`, and Codex itself asks for no approvals). Lower it in settings if you want.
+Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread, and Claude can continue one from an earlier session too, by the agent's name or its thread id. Ask for Codex's fast tier per call (`fast: true`) or for every run with `codexFast`. Codex runs with **full access** by default (`danger-full-access`, and Codex itself asks for no approvals). Lower it in settings if you want.
 
 Each call of the Codex tool goes through your session's permissions first, like any other tool: an allow rule or a permissive mode runs it, a deny rule refuses it, and otherwise you're asked once per call. With no one to ask (a `-p` run in a mode that would prompt), the call is refused. To let it run unattended, allow `mcp__overseer__codex` in your permission settings. Two limits: `PreToolUse` command hooks in settings files don't see Codex tool calls (rules, the mode and plugin permission hooks do), and on a build without plugin permission checks (2.1.280) the Codex tool refuses to run.
 
@@ -107,6 +107,7 @@ Change these in `/config` → overseer, or with `claude plugin configure oversee
 | `autoRevive` | on | If an override fails a request, drop it and tell the agent to continue |
 | `redirectCodexBash` | on | Refuse raw `codex exec` in shells; point Claude at the Overseer tool |
 | `codexSandbox` | `danger-full-access` | Or `workspace-write`, `read-only` |
+| `codexFast` | off | Run Codex on its fast tier (faster, uses more of your plan). Off keeps your Codex config's speed |
 | `codexPath` | auto | Absolute path to `codex`. Auto checks `~/.local/bin`, then `PATH`, then a login shell (finds nvm installs) |
 | `spawnReview` | off | Hold each new subagent for approve / edit / deny |
 | `spawnReviewTimeoutSec` | 90 | An unanswered review approves itself |

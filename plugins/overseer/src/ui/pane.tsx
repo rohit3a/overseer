@@ -390,7 +390,7 @@ const body = (el: Els, d: PaneData, act: PaneActions, rec: AgentRecord, width: n
         {isLive && rec.error !== undefined && <Text color="error">{truncate(rec.error, width * 3)}</Text>}
         {rec.kind === 'codex' && rec.codex !== undefined && (
           <Text dimColor wrap="truncate-end">
-            {`${rec.codex.sandbox}${rec.codex.version ? ` · codex ${rec.codex.version}` : ''}`}
+            {`${rec.codex.sandbox}${rec.codex.isFast === true ? ' · fast' : ''}${rec.codex.version ? ` · codex ${rec.codex.version}` : ''}`}
           </Text>
         )}
       </Box>

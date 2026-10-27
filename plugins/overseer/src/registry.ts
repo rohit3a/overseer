@@ -141,7 +141,9 @@ export const toHistory = (rec: AgentRecord): HistoryItem => ({
   status: rec.status,
   startedAt: rec.startedAt,
   endedAt: rec.endedAt,
-  answer: (rec.status === 'completed' ? ([...rec.thread].reverse().find(m => m.by === 'agent')?.text ?? '') : (rec.error ?? `Ended: ${rec.status}`)).slice(0, 600),
+  answer: isActive(rec.status) ? '' : (rec.status === 'completed' ? ([...rec.thread].reverse().find(m => m.by === 'agent')?.text ?? '') : (rec.error ?? `Ended: ${rec.status}`)).slice(0, 600),
+  threadId: rec.codex?.threadId,
+  cwd: rec.codex?.cwd,
 })
 
 // finds an agent by id first, then by name, newest first

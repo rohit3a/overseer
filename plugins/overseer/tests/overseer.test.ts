@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { LineBuffer } from '../src/codex/bridge'
-import { isRawCodexExec, parseLine, parseModels, unwrapShell } from '../src/codex/protocol'
+import { isRawCodexExec, parseLine, parseModels, turnStart, unwrapShell } from '../src/codex/protocol'
 import { completed, newRecord, ordered, stepEnded, stepStarted, toHistory, toolLine, withMsg } from '../src/registry'
 import { modelLabel, resolveModel } from '../src/models'
 
@@ -270,6 +270,7 @@ describe('launch fixes', () => {
 
   test('the Codex tool honours a deny from the session permissions, and starts nothing', async ($, on) => {
     const { seen } = world(on)
+    on('session.cwd', () => ({ value: '/tmp/proj' }))
     on('tool.check', () => ({ decision: 'deny', reason: 'Denied by rule mcp__overseer__codex' }))
     await start($)
     const r = result(await $.tool.call(CODEX))
@@ -279,6 +280,7 @@ describe('launch fixes', () => {
 
   test('an ask with no one to answer it refuses the Codex tool', async ($, on) => {
     world(on)
+    on('session.cwd', () => ({ value: '/tmp/proj' }))
     on('tool.check', () => ({ decision: 'ask' }))
     on('tool.call', { tool: 'AskUserQuestion' }, () => ({ deny: 'no one to ask' }))
     await start($)
@@ -287,11 +289,14 @@ describe('launch fixes', () => {
   })
 
   test('an allow lets the Codex tool go on to start Codex', async ($, on) => {
-    world(on)
+    const { tick } = world(on)
     on('session.cwd', () => ({ value: '/tmp/proj' }))
     on('tool.check', () => ({ decision: 'allow' }))
     await start($)
-    const r = result(await $.tool.call(CODEX))
+    // the mock mktemp gives no folder, so the call holds by polling with sleep
+    const call = $.tool.call(CODEX)
+    await tick(3)
+    const r = result(await call)
     expect(r.deny).toBeUndefined()
     // the mock world has no real Codex: it fails past the permission check
     expect(String(r.result)).toContain('Codex failed')
@@ -686,5 +691,17 @@ describe('pure logic', () => {
     expect(r.thread[0]?.by).toBe('parent')
     const child = { ...newRecord({ id: 'c', kind: 'codex', name: 'c', type: 'codex', description: '', spawnPrompt: 'q', parentId: 'x' }) }
     expect(ordered({ x: r, c: child }, false).map(o => [o.rec.id, o.depth])).toEqual([['x', 0], ['c', 1]])
+  })
+
+  test('a Codex agent in History keeps its thread for a later session', () => {
+    const rec = newRecord({ id: 'k', kind: 'codex', name: 'audit', type: 'codex', description: '', spawnPrompt: 'p', codex: { sandbox: 'read-only', cwd: '/w', isAlive: false, threadId: 'th-1' } })
+    expect(toHistory(rec)).toMatchObject({ name: 'audit', threadId: 'th-1', cwd: '/w' })
+  })
+
+  test('turn/start asks for the speed tier only when one was chosen', () => {
+    const tier = (isFast?: boolean) => (turnStart(1, { threadId: 't', text: 'x', isFast }).params as { serviceTierForTurn: unknown }).serviceTierForTurn
+    expect(tier(true)).toBe('fast')
+    expect(tier(false)).toBe('default')
+    expect(tier(undefined)).toBe(null)
   })
 })

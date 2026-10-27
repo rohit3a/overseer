@@ -36,6 +36,8 @@ export type CodexInfo = {
   cwd: string
   isAlive: boolean
   efforts?: string[]
+  // the speed tier asked for: true fast, false standard, undefined Codex's own default
+  isFast?: boolean
 }
 
 export type AgentRecord = {
@@ -92,6 +94,9 @@ export type HistoryItem = {
   startedAt: number
   endedAt?: number
   answer: string
+  // a Codex agent's thread, so a later session can resume it
+  threadId?: string
+  cwd?: string
 }
 
 export type CodexModel = {

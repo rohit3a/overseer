@@ -153,6 +153,45 @@ async function noteToParent($: $, text: string) {
   await appended.catch(() => undefined)
 }
 
+// A hook's 10 s budget stops only while one of its own `$` calls is in flight. A resumed
+// Codex turn runs on a process an earlier call spawned, so nothing of this call's is in
+// flight while it waits: hold a shell open until the work settles or the call is
+// interrupted, a minute at a time. With no folder for its marker it polls instead.
+async function holdWhile<T>($: $, work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  let isDone = false
+  let wake = () => {}
+  const stop = () => {
+    isDone = true
+    wake()
+  }
+  void work.then(stop, stop)
+  signal?.addEventListener('abort', stop, { once: true })
+  if (signal?.aborted === true) stop()
+  const made = isDone ? undefined : await $.process.run(['mktemp', '-d', `${(await $.env.get('TMPDIR')) ?? '/tmp'}/overseer-hold.XXXXXX`.replace('//', '/')]).catch(() => undefined)
+  const dir = made?.exitCode === 0 ? made.stdout.trim() : ''
+  const mark = dir === '' ? '' : `${dir}/done`
+  // the marker is written only while the hold waits on it, and the folder goes only after it
+  let marking: Promise<unknown> = Promise.resolve()
+  if (mark !== '') wake = () => void (marking = $.fs.write(mark, '').catch(() => undefined))
+  try {
+    while (!isDone) {
+      const argv = mark === '' ? ['sleep', '2'] : ['sh', '-c', 'i=0; while [ ! -e "$1" ] && [ $i -lt 110 ]; do sleep 0.5; i=$((i+1)); done', 'overseer-hold', mark]
+      const from = Date.now()
+      const isHeld = await $.process.run(argv, { timeoutMs: 90_000 }).then(
+        () => true,
+        () => false,
+      )
+      // a hold that fails, or returns at once without waiting, would spin; let the work go on unheld
+      if (!isDone && (!isHeld || Date.now() - from < 250)) break
+    }
+  } finally {
+    signal?.removeEventListener('abort', stop)
+    wake = () => {}
+    if (dir !== '') void marking.then(() => $.process.run(['rm', '-rf', dir])).catch(() => undefined)
+  }
+  return work
+}
+
 const SANDBOX_WORDS: Record<string, string> = {
   'danger-full-access': 'full access to this computer, with no approval prompts',
   'workspace-write': 'write access to its working folder',
@@ -177,7 +216,7 @@ async function codexPermission($: $, input: CodexToolInput, sandbox: string): Pr
   if (decision === 'deny') return reason ?? 'Permission to run Codex was denied.'
   if (permissionMode === 'dontAsk') return 'The session is in dontAsk mode and mcp__overseer__codex is not pre-approved. Allow it in the permission settings to run Codex.'
   const task = (input.resume ? `continue "${input.resume}": ` : '') + (input.prompt ?? '').trim().replace(/\s+/g, ' ')
-  const question = `Let Codex run with ${SANDBOX_WORDS[sandbox] ?? `${sandbox} access`}? Task: ${task.length > 160 ? `${task.slice(0, 160)}…` : task}`
+  const question = `Let Codex run${input.cwd ? ` in ${input.cwd}` : ''} with ${SANDBOX_WORDS[sandbox] ?? `${sandbox} access`}? Task: ${task.length > 160 ? `${task.slice(0, 160)}…` : task}`
   try {
     const answer = await $.ui.ask(question, { header: 'Codex', options: ['Allow', 'Deny'] })
     return answer === 'Allow' ? undefined : 'The user declined to let Codex run this task.'
@@ -244,7 +283,9 @@ type Controller = {
   sawModelSend: (to: string, text: string, fromAgent?: string) => Promise<void>
   revive: (id: string) => Promise<void>
   // no signal on 2.1.280, which hands a hook no next.signal
-  codexTool: (input: CodexToolInput, parentId: string | undefined, signal: AbortSignal | undefined) => Promise<string>
+  // where a call would run, resolved before its permission check; a string refuses it
+  planCodex: (input: CodexToolInput) => Promise<CodexPlan | string>
+  codexTool: (plan: CodexPlan, parentId: string | undefined, signal: AbortSignal | undefined) => Promise<string>
   saveHistory: () => Promise<void>
   endAll: () => Promise<void>
   // at a /clear, before anything else: startups begun before it stop instead of going on
@@ -267,6 +308,20 @@ type CodexToolInput = {
   cwd?: string
   resume?: string
   background?: boolean
+  fast?: boolean
+}
+
+// a Codex call resolved: what it continues, the folder it runs in, and the conversation it came from
+type CodexPlan = {
+  input: CodexToolInput
+  prompt: string
+  model?: string
+  effort?: string
+  // this call's speed tier: true fast, false standard, undefined the thread's own
+  isFast?: boolean
+  cwd: string
+  target: { kind: 'new' } | { kind: 'live'; id: string } | { kind: 'earlier'; name: string; threadId: string }
+  at: number
 }
 
 let ctl: Controller | undefined
@@ -287,6 +342,7 @@ export const register: Register = (on, options) => {
     redirectCodexBash: options.redirectCodexBash !== false,
     codexSandbox: typeof options.codexSandbox === 'string' && options.codexSandbox !== '' ? options.codexSandbox : 'danger-full-access',
     codexPath: typeof options.codexPath === 'string' ? options.codexPath.trim() : '',
+    codexFast: options.codexFast === true,
     spawnReview: options.spawnReview === true,
     spawnReviewTimeoutSec: typeof options.spawnReviewTimeoutSec === 'number' && options.spawnReviewTimeoutSec > 0 ? options.spawnReviewTimeoutSec : 90,
     historyDays: typeof options.historyDays === 'number' && options.historyDays > 0 ? options.historyDays : 7,
@@ -312,6 +368,7 @@ export const register: Register = (on, options) => {
     const procs = new Map<string, Proc>()
     const liveBuf = new Map<string, string>()
     const savedHistory = new Set<string>()
+    const savedThreads = new Set<string>()
     let codex: Codex | undefined
     let codexLookup: Promise<Codex | undefined> | undefined
     let lastStatus = ''
@@ -398,16 +455,19 @@ export const register: Register = (on, options) => {
 
     const saveHistory = async () => {
       const ended = Object.values(cache).filter(a => isEnded(a.status) && !savedHistory.has(a.id))
-      if (ended.length === 0) return
+      // a Codex thread is kept while it still runs, so a session that ends mid-turn can resume it
+      const threads = Object.values(cache).filter(a => a.kind === 'codex' && a.codex?.threadId !== undefined && !isEnded(a.status) && !savedThreads.has(a.id))
+      if (ended.length === 0 && threads.length === 0) return
       try {
         const stored = ((await $.store.get('history')) ?? []) as HistoryItem[]
         const cutoff = Date.now() - opt.historyDays * 86_400_000
-        const fresh = ended.map(toHistory)
+        const fresh = [...ended, ...threads].map(toHistory)
         const merged = [...fresh, ...stored.filter(item => !fresh.some(f => f.startedAt === item.startedAt && f.name === item.name))]
           .filter(item => (item.endedAt ?? item.startedAt) >= cutoff)
           .slice(0, 200)
         await $.store.set('history', merged)
         for (const a of ended) savedHistory.add(a.id)
+        for (const a of threads) savedThreads.add(a.id)
       } catch {
         // history is a convenience; never let it break anything
       }
@@ -886,17 +946,20 @@ export const register: Register = (on, options) => {
           codex: r.codex === undefined ? r.codex : { ...r.codex, threadId: t.threadId, isAlive: true },
         })),
       )
+      void saveHistory()
       return p
     }
 
     // starts a turn, applying any pending model/effort override; a cancel during
     // startup stops before the turn, or interrupts it as soon as it has an id
-    const startTurn = async (id: string, text: string, signal?: AbortSignal) => {
+    // o.at: the conversation the request came from, when it began before this call
+    const startTurn = async (id: string, text: string, signal?: AbortSignal, o?: { isFast?: boolean; at?: number }) => {
       const rec = cache[id]
       if (rec === undefined) throw new Error('No such Codex agent')
+      const isFast = o?.isFast !== undefined ? o.isFast : opt.codexFast ? true : undefined
       // a function, so each check reads the signal and the epoch now, after the awaits before it;
       // a cancel or a /clear before the turn has an id ends the process, so nothing starts after all
-      const at = epoch
+      const at = o?.at ?? epoch
       const isStale = () => signal?.aborted === true || epoch !== at
       const staleError = () => new Error(epoch !== at ? CLEARED : CANCELLED)
       let p: Proc
@@ -921,7 +984,7 @@ export const register: Register = (on, options) => {
       const threadId = fresh.codex!.threadId!
       let res: unknown
       try {
-        res = await call(p, cid => rpc.turnStart(cid, { threadId, text, model: ov?.model, effort: ov?.effort }))
+        res = await call(p, cid => rpc.turnStart(cid, { threadId, text, model: ov?.model, effort: ov?.effort, isFast }))
       } catch (err) {
         // no turn started: the next turn's end must not answer this caller
         p.waiters = p.waiters.filter(w => w !== waiter)
@@ -945,6 +1008,7 @@ export const register: Register = (on, options) => {
           model: ov?.model ?? r.model,
           effort: ov?.effort ?? r.effort,
           override: undefined,
+          codex: r.codex === undefined ? r.codex : { ...r.codex, isFast },
         })),
       )
       return done
@@ -956,7 +1020,7 @@ export const register: Register = (on, options) => {
         why === 'follow-up'
           ? `[Overseer] Codex agent "${rec.name}" finished a follow-up the user sent it from the Overseer panel. Its reply:`
           : `[Overseer] Background Codex agent "${rec.name}" finished. Its reply:`
-      await noteToParent($, `${head}\n${text.slice(0, 4000)}`)
+      await noteToParent($, `${head}\n${text}`)
     }
 
     const sendCodex = async (rec: AgentRecord, text: string, msgId: string) => {
@@ -978,42 +1042,119 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const codexTool = async (input: CodexToolInput, parentId: string | undefined, signal: AbortSignal | undefined): Promise<string> => {
+    // a Codex agent in the pane, new or picking up an earlier thread
+    const newCodex = async (plan: CodexPlan, parentId: string | undefined, earlier?: { name: string; threadId: string }) => {
+      codexCounter++
+      const rec = newRecord({
+        id: newId('codex'),
+        kind: 'codex',
+        name: uniqueName(cache, earlier?.name || plan.input.name?.trim() || `codex-${codexCounter}`),
+        type: 'codex',
+        description: plan.prompt.slice(0, 80),
+        parentId,
+        spawnPrompt: plan.prompt,
+        status: 'starting',
+        codex: { sandbox: opt.codexSandbox, cwd: plan.cwd, isAlive: false, threadId: earlier?.threadId, isFast: plan.isFast },
+      })
+      const withOverride: AgentRecord = { ...rec, override: plan.model || plan.effort ? { model: plan.model, effort: plan.effort } : undefined, activity: 'Starting Codex…' }
+      await spawned(withOverride)
+      return withOverride
+    }
+
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    const heldThread = (threadId: string) => Object.values(cache).find(a => a.kind === 'codex' && a.codex?.threadId === threadId)
+
+    // what `resume` names: an exact id or thread id before any name, this session before History,
+    // and any thread id Codex might still hold
+    const resolveResume = async (key: string): Promise<{ live: AgentRecord } | { earlier: { name: string; threadId: string; cwd?: string } } | undefined> => {
+      const byId = cache[key]?.kind === 'codex' ? cache[key] : heldThread(key)
+      if (byId !== undefined) return { live: byId }
+      const stored = (((await $.store.get('history').catch(() => undefined)) ?? []) as HistoryItem[])
+        .filter(h => h.kind === 'codex' && h.threadId !== undefined)
+        .sort((a, b) => b.startedAt - a.startedAt)
+      const asEarlier = (h: HistoryItem) => ({ earlier: { name: h.name, threadId: h.threadId!, cwd: h.cwd } })
+      const storedThread = stored.find(h => h.threadId === key)
+      if (storedThread !== undefined) return asEarlier(storedThread)
+      const lower = key.toLowerCase()
+      const byName = Object.values(cache)
+        .filter(a => a.kind === 'codex' && a.name.toLowerCase() === lower)
+        .sort((a, b) => b.startedAt - a.startedAt)[0]
+      if (byName !== undefined) return { live: byName }
+      const storedName = stored.find(h => h.name.toLowerCase() === lower)
+      if (storedName !== undefined) return asEarlier(storedName)
+      return UUID.test(key) ? { earlier: { name: `codex-${key.slice(0, 8)}`, threadId: key } } : undefined
+    }
+
+    const planCodex = async (input: CodexToolInput): Promise<CodexPlan | string> => {
+      const at = epoch
       const prompt = (input.prompt ?? '').trim()
-      const model = input.model?.trim() || undefined
-      const effort = input.effort?.trim() || undefined
+      const base = {
+        input,
+        prompt,
+        model: input.model?.trim() || undefined,
+        effort: input.effort?.trim() || undefined,
+        isFast: input.fast ?? (opt.codexFast ? true : undefined),
+        at,
+      }
+      const asked = input.cwd?.trim() || undefined
+      const key = input.resume?.trim() ?? ''
+      if (key === '') {
+        if (prompt === '') return 'Give Codex a task in prompt.'
+        return { ...base, cwd: asked ?? (await $.session.cwd()), target: { kind: 'new' } }
+      }
+      if (prompt === '') return 'Give the follow-up message in prompt.'
+      const found = await resolveResume(key)
+      if (found === undefined) return `No Codex agent named "${key}". Start a new one without resume.`
+      if ('live' in found) {
+        const rec = found.live
+        if (rec.codex?.turnId !== undefined || rec.status === 'starting') return `Codex agent "${rec.name}" is still working. Wait for it, or the user can steer it from the Overseer panel.`
+        const cwd = rec.codex?.cwd ?? (await $.session.cwd())
+        if (asked !== undefined && asked !== cwd) return `Codex agent "${rec.name}" works in ${cwd}. Leave cwd out to continue it there, or start a new agent for ${asked}.`
+        return { ...base, cwd, target: { kind: 'live', id: rec.id } }
+      }
+      const e = found.earlier
+      return { ...base, cwd: asked ?? e.cwd ?? (await $.session.cwd()), target: { kind: 'earlier', name: e.name, threadId: e.threadId } }
+    }
+
+    // earlier threads being taken up, so two calls never open one twice
+    const adopting = new Set<string>()
+
+    const codexTool = async (plan: CodexPlan, parentId: string | undefined, signal: AbortSignal | undefined): Promise<string> => {
+      const { input, prompt, model, effort } = plan
+      if (epoch !== plan.at) return CLEARED
+      const busy = (name: string) => `Codex agent "${name}" is still working. Wait for it, or the user can steer it from the Overseer panel.`
 
       let rec: AgentRecord
-      if (input.resume !== undefined && input.resume.trim() !== '') {
-        const found = findAgent(cache, input.resume.trim())
-        if (found === undefined || found.kind !== 'codex') return `No Codex agent named "${input.resume}". Start a new one without resume.`
-        if (prompt === '') return 'Give the follow-up message in prompt.'
-        if (found.codex?.turnId !== undefined) return `Codex agent "${found.name}" is still working. Wait for it, or the user can steer it from the Overseer panel.`
+      let target = plan.target
+      // since the plan, this session may have taken the thread up itself
+      if (target.kind === 'earlier') {
+        const held = heldThread(target.threadId)
+        if (held !== undefined) target = { kind: 'live', id: held.id }
+      }
+      if (target.kind === 'earlier') {
+        const { threadId } = target
+        if (adopting.has(threadId)) return `Codex thread ${threadId} is already starting here. Wait for it, then continue it by name.`
+        adopting.add(threadId)
+        try {
+          rec = await newCodex(plan, parentId, target)
+        } finally {
+          adopting.delete(threadId)
+        }
+        await mut(a => patch(a, rec.id, r => withMsg(r, 'system', `Resumed Codex thread ${threadId} from an earlier session.`)))
+      } else if (target.kind === 'live') {
+        const found = cache[target.id]
+        if (found === undefined) return `No Codex agent named "${input.resume}". Start a new one without resume.`
+        if (found.codex?.turnId !== undefined || found.status === 'starting') return busy(found.name)
         rec = found
         await mut(a => patch(a, rec.id, r => withMsg({ ...r, status: 'running', endedAt: undefined, override: model || effort ? { model, effort } : r.override }, 'parent', prompt)))
       } else {
-        if (prompt === '') return 'Give Codex a task in prompt.'
-        codexCounter++
-        const id = newId('codex')
-        const cwd = input.cwd?.trim() || (await $.session.cwd())
-        rec = newRecord({
-          id,
-          kind: 'codex',
-          name: uniqueName(cache, input.name?.trim() || `codex-${codexCounter}`),
-          type: 'codex',
-          description: prompt.slice(0, 80),
-          parentId,
-          spawnPrompt: prompt,
-          status: 'starting',
-          codex: { sandbox: opt.codexSandbox, cwd, isAlive: false },
-        })
-        rec = { ...rec, override: model || effort ? { model, effort } : undefined, activity: 'Starting Codex…' }
-        await spawned(rec)
+        rec = await newCodex(plan, parentId)
       }
+      if (epoch !== plan.at) return CLEARED
 
-      const run = startTurn(rec.id, prompt, input.background === true ? undefined : signal)
+      const run = startTurn(rec.id, prompt, input.background === true ? undefined : signal, { isFast: plan.isFast, at: plan.at })
       if (input.background === true) {
-        const at = epoch
+        const at = plan.at
         run
           .then(text => (epoch === at ? informParentOfCodex(cache[rec.id] ?? rec, text, 'background') : undefined))
           .catch(err => mut(a => patch(a, rec.id, r => ({ ...r, status: 'failed', endedAt: Date.now(), activity: '', error: err instanceof Error ? err.message : String(err) }))))
@@ -1058,6 +1199,7 @@ export const register: Register = (on, options) => {
       liveBuf.clear()
       draftBuf.clear()
       savedHistory.clear()
+      savedThreads.clear()
       overrideFailed.clear()
       firstOfKind.clear()
       hasAutoOpened = false
@@ -1237,7 +1379,7 @@ export const register: Register = (on, options) => {
       }
     }
 
-    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, codexTool, saveHistory, endAll, fence, reset, actions, debug, debugAt }
+    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, planCodex, codexTool, saveHistory, endAll, fence, reset, actions, debug, debugAt }
 
     // ───────────────────────────── timers ─────────────────────────────
 
@@ -1338,6 +1480,7 @@ export const register: Register = (on, options) => {
           cwd: { type: 'string', description: 'Working directory. Defaults to the session\'s.' },
           resume: { type: 'string', description: 'Name (or thread id) of an earlier Codex agent to continue.' },
           background: { type: 'boolean', description: 'Return at once and let Codex work in the background.' },
+          fast: { type: 'boolean', description: 'Run on Codex\'s fast tier (about 1.5-2x speed, uses more of the plan). Leave out for the user\'s setting; false for standard speed.' },
         },
         required: ['prompt'],
       },
@@ -1534,12 +1677,15 @@ export const register: Register = (on, options) => {
     if (ctl === undefined) return { result: 'Overseer is still starting; try again in a moment.' }
     if (!isEnabled) return { result: 'Overseer is off for this session, so its Codex tool is unavailable. The user can turn it back on with /overseer on.' }
     const raw = e as unknown as CodexToolInput
-    const input: CodexToolInput = { prompt: raw.prompt, name: raw.name, model: raw.model, effort: raw.effort, cwd: raw.cwd, resume: raw.resume, background: raw.background }
-    const refusal = await codexPermission($, input, opt.codexSandbox).catch(
+    const input: CodexToolInput = { prompt: raw.prompt, name: raw.name, model: raw.model, effort: raw.effort, cwd: raw.cwd, resume: raw.resume, background: raw.background, fast: raw.fast }
+    // the folder Codex would really run in is what the permission check sees
+    const plan = await ctl.planCodex(input)
+    if (typeof plan === 'string') return { result: plan }
+    const refusal = await codexPermission($, { ...input, cwd: plan.cwd }, opt.codexSandbox).catch(
       (err: unknown) => `Overseer could not check permission for Codex: ${err instanceof Error ? err.message : String(err)}`,
     )
     if (refusal !== undefined) return { deny: refusal }
-    const text = await ctl.codexTool(input, e.agentId, next.signal)
+    const text = await holdWhile($, ctl.codexTool(plan, e.agentId, next.signal), next.signal)
     return { result: text }
   }).catch(($, e, next) => ({ result: `Overseer's Codex tool failed: ${next.error?.message ?? 'unknown error'}` }))
 

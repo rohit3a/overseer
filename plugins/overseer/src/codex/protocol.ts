@@ -25,12 +25,15 @@ export const threadResume = (id: number, o: { threadId: string; cwd: string; san
 
 const textInput = (text: string) => [{ type: 'text', text, text_elements: [] }]
 
-export const turnStart = (id: number, o: { threadId: string; text: string; model?: string; effort?: string }): Rpc =>
+// isFast: true asks for Codex's fast tier, false for standard speed, this turn only;
+// undefined keeps the thread's tier (the user's Codex config)
+export const turnStart = (id: number, o: { threadId: string; text: string; model?: string; effort?: string; isFast?: boolean }): Rpc =>
   req(id, 'turn/start', {
     threadId: o.threadId,
     input: textInput(o.text),
     model: o.model ?? null,
     effort: o.effort ?? null,
+    serviceTierForTurn: o.isFast === undefined ? null : o.isFast ? 'fast' : 'default',
   })
 
 export const turnSteer = (id: number, o: { threadId: string; turnId: string; text: string }): Rpc =>
