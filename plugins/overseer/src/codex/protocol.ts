@@ -188,11 +188,19 @@ export const threadOf = (result: unknown) => {
   return { threadId: str(obj(r.thread).id), model: str(r.model) || undefined, effort: str(r.reasoningEffort) || undefined }
 }
 
-// raw `codex exec …` in a shell command, for the redirect
-// codex in command position (start of a line, or after ; & | ( ` $( ), optionally
-// after env assignments, npx or exec, with any flags before the subcommand:
-// `codex exec`, `/path/to/codex exec`, `codex -m x exec`, `npx codex e`.
-// Quoted or echoed text (`echo "codex exec"`, `grep 'codex exec'`) does not count.
-const RAW_CODEX = /(?:^|[;&|(`\n]|\$\()\s*(?:\w+=\S*\s+)*(?:(?:npx|exec|command)\s+)?(?:\S*\/)?codex(?:\s+-{1,2}[\w-]+(?:[= ](?!exec\b|e\b)[^\s-]\S*)?)*\s+(?:exec|e)(?:\s|$)/m
+// turn/start answers { turn: { id } }
+export const turnIdOf = (result: unknown) => str(obj(obj(result).turn).id) || undefined
 
-export const isRawCodexExec = (command: string) => RAW_CODEX.test(command)
+// raw `codex exec …` in a shell command, for the refusal
+// codex in command position (start of a line, or after ; & | ( ` $( ), optionally
+// after env assignments and launchers (env, npx, bunx, exec, command, nohup, time,
+// sudo) with their flags, with any flags before the subcommand: `codex exec`,
+// `/path/to/codex exec`, `codex -m x exec`, `npx codex e`, `env FOO=1 codex exec`.
+// Quoted or echoed text (`echo "codex exec"`, `grep 'codex exec'`) does not count.
+const RAW_CODEX = /(?:^|[;&|(`\n]|\$\()\s*(?:\w+=\S*\s+)*(?:(?:env|npx|bunx|pnpx|exec|command|nohup|time|sudo)(?:\s+-{1,2}[\w-]+)*\s+(?:\w+=\S*\s+)*)*(?:\S*\/)?codex(?:\s+-{1,2}[\w-]+(?:[= ](?!exec\b|e\b)[^\s-]\S*)?)*\s+(?:exec|e)(?:\s|$)/m
+
+// quoted text is an argument, never a command: `printf 'a; codex exec'` stays allowed
+const blankQuotes = (command: string) => command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, '""')
+
+// a whole `sh -c '…'` is unwrapped first, so the command inside its quotes still counts
+export const isRawCodexExec = (command: string) => RAW_CODEX.test(blankQuotes(unwrapShell(command)))

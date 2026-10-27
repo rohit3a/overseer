@@ -11,3 +11,4 @@ else
   echo "skipping tsc: run scripts/types.sh first"
 fi
 claude plugin test plugins/overseer
+claude plugin test plugins/overseer-courier

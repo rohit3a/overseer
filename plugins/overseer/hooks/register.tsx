@@ -105,8 +105,10 @@ async function update<K extends Key>($: $, key: K, fn: (v: Values[K]) => Values[
     const value = fn((local[key] ?? INITIAL[key]) as Values[K])
     local[key] = value
     if (key === 'outbox' && courierDir !== '') {
+      // bound to this session's folder: a write still queued at a /clear lands in the old one, which session.end waits out before removing it
       const text = JSON.stringify(value)
-      outboxWrites = outboxWrites.then(() => $.fs.write(`${courierDir}/outbox.json`, text)).catch(() => undefined)
+      const dir = courierDir
+      outboxWrites = outboxWrites.then(() => $.fs.write(`${dir}/outbox.json`, text)).catch(() => undefined)
     }
     $.ui.invalidate('ui.render')
     return value
@@ -151,6 +153,52 @@ async function noteToParent($: $, text: string) {
   await appended.catch(() => undefined)
 }
 
+const SANDBOX_WORDS: Record<string, string> = {
+  'danger-full-access': 'full access to this computer, with no approval prompts',
+  'workspace-write': 'write access to its working folder',
+  'read-only': 'read-only access',
+}
+
+// the session's permission mode, as the last prompt carried it: an `ask` in
+// dontAsk mode is refused, not put to the person
+let permissionMode: string | undefined
+
+/** Why the Codex tool may not run, or undefined when the session's permissions allow it. */
+async function codexPermission($: $, input: CodexToolInput, sandbox: string): Promise<string | undefined> {
+  let checked: Promise<{ decision: string; reason?: string }>
+  try {
+    checked = $.tool.check({ tool: CODEX_TOOL, input })
+  } catch {
+    // a dialog alone could overrule a deny rule it can't see
+    return 'This Claude Code build cannot check permissions for plugin tools, so Overseer will not run Codex here. Update Claude Code to use the Codex tool.'
+  }
+  const { decision, reason } = await checked
+  if (decision === 'allow') return undefined
+  if (decision === 'deny') return reason ?? 'Permission to run Codex was denied.'
+  if (permissionMode === 'dontAsk') return 'The session is in dontAsk mode and mcp__overseer__codex is not pre-approved. Allow it in the permission settings to run Codex.'
+  const task = (input.resume ? `continue "${input.resume}": ` : '') + (input.prompt ?? '').trim().replace(/\s+/g, ' ')
+  const question = `Let Codex run with ${SANDBOX_WORDS[sandbox] ?? `${sandbox} access`}? Task: ${task.length > 160 ? `${task.slice(0, 160)}…` : task}`
+  try {
+    const answer = await $.ui.ask(question, { header: 'Codex', options: ['Allow', 'Deny'] })
+    return answer === 'Allow' ? undefined : 'The user declined to let Codex run this task.'
+  } catch {
+    return 'Running Codex needs the user\'s permission, and they could not be asked here. Allow mcp__overseer__codex in the permission settings to run it unattended.'
+  }
+}
+
+// Makes `dir` a folder only this user can enter, or refuses: a path someone else
+// made first (a symlink, a file, another owner's folder) is never used.
+const PRIVATE_DIR = 'umask 077; d=$1; if [ -e "$d" ] || [ -L "$d" ]; then [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && chmod 700 "$d"; else mkdir -m 700 "$d"; fi'
+
+/** The courier's folder for this session, made private; '' when it can't be. */
+async function makeCourierDir($: $): Promise<string> {
+  const dir = `${((await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '')}/overseer-${await $.session.id()}`
+  const made = await $.process.run(['sh', '-c', PRIVATE_DIR, 'overseer', dir]).catch(() => undefined)
+  if (made?.exitCode === 0) return dir
+  $.ui.log(`overseer: ${dir} exists and isn't a private folder of this user; messages to subagents are off`, { to: 'debug' })
+  return ''
+}
+
 const COURIER_INSTALL = 'claude plugin install overseer-courier@overseer'
 
 // ── module mirrors of host state, so hot paths never wait on a read ──
@@ -178,6 +226,10 @@ type Proc = {
   ended: Set<string>
   isAlive: boolean
   stderr: string
+  // the current turn: its id from turn/start's answer, before turn/started arrives,
+  // and the reason of an error notification, read when the turn ends
+  turnId?: string
+  lastError?: string
   stop?: () => void
 }
 
@@ -195,6 +247,10 @@ type Controller = {
   codexTool: (input: CodexToolInput, parentId: string | undefined, signal: AbortSignal | undefined) => Promise<string>
   saveHistory: () => Promise<void>
   endAll: () => Promise<void>
+  // at a /clear, before anything else: startups begun before it stop instead of going on
+  fence: () => void
+  // after a /clear: the next conversation starts with an empty pane
+  reset: () => Promise<void>
   actions: PaneActions
   debug: (ev: Record<string, unknown>) => void
   debugAt: (at: 'step' | 'complete' | 'tool', id: string, index: number) => Promise<void>
@@ -214,6 +270,12 @@ type CodexToolInput = {
 }
 
 let ctl: Controller | undefined
+
+// finished agents the pane keeps before the oldest move to History alone
+const MAX_FINISHED = 50
+
+const CANCELLED = 'Cancelled before Codex started its turn.'
+const CLEARED = 'The conversation was cleared before Codex started its turn.'
 
 const frame = (text: string) => `[Message from the user, sent through the Overseer panel]\n${text}`
 
@@ -241,9 +303,9 @@ export const register: Register = (on, options) => {
     cache = await read($, 'agents')
     hasAutoOpened = Object.keys(cache).length > 0
     if (!hasState) {
-      courierDir = `${((await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '')}/overseer-${await $.session.id()}`
+      courierDir = await makeCourierDir($)
       // the courier reads it four times a second, and each read of a missing file is an error in the debug log
-      await $.fs.write(`${courierDir}/outbox.json`, '[]').catch(() => undefined)
+      if (courierDir !== '') await $.fs.write(`${courierDir}/outbox.json`, '[]').catch(() => undefined)
     }
     await update($, 'ui', u => ({ ...u, selected: undefined, isPromptOpen: false, editingReview: undefined, transcriptFor: undefined, transcriptCount: undefined })).catch(() => undefined)
 
@@ -255,6 +317,8 @@ export const register: Register = (on, options) => {
     let lastStatus = ''
     let historyTimer: { cancel: () => void } | undefined
     let codexCounter = Object.values(cache).filter(a => a.kind === 'codex').length
+    // bumped at a /clear; a Codex startup begun before it stops instead of going on
+    let epoch = 0
 
     const toast = (text: string) => $.ui.toast(text)
     const loadedAt = Date.now()
@@ -346,6 +410,19 @@ export const register: Register = (on, options) => {
         for (const a of ended) savedHistory.add(a.id)
       } catch {
         // history is a convenience; never let it break anything
+      }
+      await pruneFinished()
+    }
+
+    // the pane keeps the latest finished agents; older ones live on in History
+    const pruneFinished = async () => {
+      const finished = Object.values(cache)
+        .filter(a => isEnded(a.status) && savedHistory.has(a.id) && !(a.kind === 'codex' && a.codex?.isAlive === true))
+        .sort((x, y) => (x.endedAt ?? x.startedAt) - (y.endedAt ?? y.startedAt))
+      if (finished.length > MAX_FINISHED) {
+        const drop = new Set(finished.slice(0, finished.length - MAX_FINISHED).map(a => a.id))
+        await mut(a => Object.fromEntries(Object.entries(a).filter(([id]) => !drop.has(id))))
+        for (const id of drop) savedHistory.delete(id)
       }
     }
 
@@ -457,7 +534,16 @@ export const register: Register = (on, options) => {
       else await sendClaude(rec, text, msgId)
     }
 
-    const sawCourierSend = async (to: string, text: string, isDelivered: boolean, reason?: string) => {
+    // receipts settle one at a time: two identical messages each find their own item,
+    // the oldest still queued, because the first receipt has removed its item first
+    let receipts: Promise<void> = Promise.resolve()
+    const sawCourierSend = (to: string, text: string, isDelivered: boolean, reason?: string): Promise<void> => {
+      const run = receipts.then(() => settleReceipt(to, text, isDelivered, reason)).catch(() => undefined)
+      receipts = run
+      return run
+    }
+
+    const settleReceipt = async (to: string, text: string, isDelivered: boolean, reason?: string) => {
       const box = await read($, 'outbox')
       const queued = box.find(i => i.to === to && i.text === text)
       // a receipt that arrives after the watchdog gave up still lands on its message
@@ -585,6 +671,7 @@ export const register: Register = (on, options) => {
           debug({ ev: 'codexTurnStarted', id, turnId: ev.turnId })
           if (p.ended.has(ev.turnId)) return
           p.turnText = ''
+          p.lastError = undefined
           void mut(a =>
             patch(a, id, r => ({
               ...r,
@@ -624,11 +711,16 @@ export const register: Register = (on, options) => {
           void mut(a => patch(a, id, r => ({ ...r, model: ev.model })))
           return
         case 'error':
-          if (!ev.willRetry) void mut(a => patch(a, id, r => ({ ...r, error: ev.text })))
+          if (!ev.willRetry) {
+            p.lastError = ev.text
+            void mut(a => patch(a, id, r => ({ ...r, error: ev.text })))
+          }
           return
         case 'turnCompleted': {
           debug({ ev: 'codexTurnEnded', id, turnId: ev.turnId, status: ev.status, chainFrom: p.chainFrom })
           p.ended.add(ev.turnId)
+          // only a turn that just ended can still send a late "started"
+          if (p.ended.size > 50) p.ended = new Set([...p.ended].slice(-20))
           if (ev.turnId === p.chainFrom) {
             p.chainFrom = undefined
             void mut(a => patch(a, id, r => withMsg(r, 'system', 'Turn interrupted to apply the new settings.')))
@@ -637,6 +729,7 @@ export const register: Register = (on, options) => {
           // an older turn ending after a newer one started changes nothing
           if (cache[id]?.codex?.turnId !== undefined && cache[id]?.codex?.turnId !== ev.turnId) return
           liveBuf.delete(id)
+          p.turnId = undefined
           const status = ev.status === 'failed' ? 'failed' : 'completed'
           void mut(a =>
             patch(a, id, r => {
@@ -645,14 +738,22 @@ export const register: Register = (on, options) => {
                 status,
                 endedAt: Date.now(),
                 activity: '',
-                error: ev.error ?? (status === 'failed' ? 'Codex turn failed' : undefined),
+                error: ev.error ?? (status === 'failed' ? (p.lastError ?? 'Codex turn failed') : undefined),
                 codex: r.codex === undefined ? r.codex : { ...r.codex, turnId: undefined },
               }
               if (ev.status === 'interrupted') nx = withMsg(nx, 'system', 'Turn stopped.')
               return nx
             }),
           )
-          const text = p.turnText.trim() !== '' ? p.turnText.trim() : ev.status === 'interrupted' ? '(Codex turn was stopped)' : '(Codex finished without a message)'
+          const reply = p.turnText.trim()
+          // an `error` notification before the end may carry the only reason
+          const why = ev.error ?? p.lastError
+          const text =
+            status === 'failed'
+              ? `(Codex turn failed: ${why ?? 'no reason given'})${reply !== '' ? `\n\nWhat it wrote before failing:\n${reply}` : ''}`
+              : ev.status === 'interrupted'
+                ? `(Codex turn was stopped before it finished)${reply !== '' ? `\n\nWhat it wrote before stopping:\n${reply}` : ''}`
+                : reply !== '' ? reply : '(Codex finished without a message)'
           for (const w of p.waiters.splice(0)) w(text)
           scheduleHistory()
           debug({ ev: 'codexTurnCompleted', id, status: ev.status, text: text.slice(0, 200) })
@@ -730,6 +831,8 @@ export const register: Register = (on, options) => {
           })),
         )
         void $.process.run(['rm', '-rf', inbox]).catch(() => undefined)
+        // a quit Codex agent no longer holds its place in the pane
+        void writes.then(() => pruneFinished()).catch(() => undefined)
       })()
 
       try {
@@ -786,17 +889,56 @@ export const register: Register = (on, options) => {
       return p
     }
 
-    // starts a turn, applying any pending model/effort override
-    const startTurn = async (id: string, text: string) => {
+    // starts a turn, applying any pending model/effort override; a cancel during
+    // startup stops before the turn, or interrupts it as soon as it has an id
+    const startTurn = async (id: string, text: string, signal?: AbortSignal) => {
       const rec = cache[id]
       if (rec === undefined) throw new Error('No such Codex agent')
-      const p = await ensureThread(rec)
+      // a function, so each check reads the signal and the epoch now, after the awaits before it;
+      // a cancel or a /clear before the turn has an id ends the process, so nothing starts after all
+      const at = epoch
+      const isStale = () => signal?.aborted === true || epoch !== at
+      const staleError = () => new Error(epoch !== at ? CLEARED : CANCELLED)
+      let p: Proc
+      try {
+        p = await ensureThread(rec)
+      } catch (err) {
+        if (isStale()) {
+          procs.get(id)?.stop?.()
+          throw staleError()
+        }
+        throw err
+      }
+      if (isStale()) {
+        p.stop?.()
+        throw staleError()
+      }
       const fresh = cache[id] ?? rec
       const ov = fresh.override
       p.turnText = ''
-      const done = new Promise<string>(resolve => p.waiters.push(resolve))
-      await call(p, cid => rpc.turnStart(cid, { threadId: fresh.codex!.threadId!, text, model: ov?.model, effort: ov?.effort }))
+      let waiter: (text: string) => void = () => undefined
+      const done = new Promise<string>(resolve => p.waiters.push((waiter = resolve)))
+      const threadId = fresh.codex!.threadId!
+      let res: unknown
+      try {
+        res = await call(p, cid => rpc.turnStart(cid, { threadId, text, model: ov?.model, effort: ov?.effort }))
+      } catch (err) {
+        // no turn started: the next turn's end must not answer this caller
+        p.waiters = p.waiters.filter(w => w !== waiter)
+        // whether Codex started the turn is unknown: end it rather than leave it running unwatched
+        if (isStale()) {
+          p.stop?.()
+          throw staleError()
+        }
+        throw err
+      }
+      p.turnId = rpc.turnIdOf(res) ?? p.turnId
       debug({ ev: 'codexTurnStart', id, model: ov?.model, effort: ov?.effort })
+      if (isStale()) {
+        const turnId = p.turnId ?? cache[id]?.codex?.turnId
+        if (turnId !== undefined) void call(p, cid => rpc.turnInterrupt(cid, { threadId, turnId })).catch(() => p.stop?.())
+        else p.stop?.()
+      }
       await mut(a =>
         patch(a, id, r => ({
           ...r,
@@ -826,8 +968,9 @@ export const register: Register = (on, options) => {
           return
         }
         await mut(a => patch(a, rec.id, r => setMsgState({ ...r, status: 'running', endedAt: undefined, activity: 'Starting a new turn…' }, msgId, 'sent')))
+        const at = epoch
         const reply = await startTurn(rec.id, text)
-        await informParentOfCodex(rec, reply, 'follow-up')
+        if (epoch === at) await informParentOfCodex(rec, reply, 'follow-up')
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
         await mut(a => patch(a, rec.id, r => withMsg(setMsgState(r, msgId, 'failed'), 'system', `Not delivered: ${reason}`)))
@@ -868,19 +1011,22 @@ export const register: Register = (on, options) => {
         await spawned(rec)
       }
 
-      const run = startTurn(rec.id, prompt)
+      const run = startTurn(rec.id, prompt, input.background === true ? undefined : signal)
       if (input.background === true) {
+        const at = epoch
         run
-          .then(text => informParentOfCodex(cache[rec.id] ?? rec, text, 'background'))
+          .then(text => (epoch === at ? informParentOfCodex(cache[rec.id] ?? rec, text, 'background') : undefined))
           .catch(err => mut(a => patch(a, rec.id, r => ({ ...r, status: 'failed', endedAt: Date.now(), activity: '', error: err instanceof Error ? err.message : String(err) }))))
         return `Started Codex agent "${cache[rec.id]?.name ?? rec.name}" in the background. The user can watch and steer it in the Overseer panel; you'll get its reply as a note when it finishes. Continue it later with resume: "${cache[rec.id]?.name ?? rec.name}".`
       }
 
+      // before the turn has an id, startTurn sees the signal itself
       const onAbort = () => {
         const cur = cache[rec.id]
         const p = procs.get(rec.id)
-        if (p !== undefined && cur?.codex?.threadId !== undefined && cur.codex.turnId !== undefined) {
-          void call(p, id => rpc.turnInterrupt(id, { threadId: cur.codex!.threadId!, turnId: cur.codex!.turnId! })).catch(() => undefined)
+        const turnId = cur?.codex?.turnId ?? p?.turnId
+        if (p !== undefined && cur?.codex?.threadId !== undefined && turnId !== undefined) {
+          void call(p, id => rpc.turnInterrupt(id, { threadId: cur.codex!.threadId!, turnId })).catch(() => p.stop?.())
         }
       }
       signal?.addEventListener('abort', onAbort, { once: true })
@@ -890,8 +1036,9 @@ export const register: Register = (on, options) => {
         return `${reply}\n\n[Codex agent "${cur.name}"${cur.codex?.threadId ? `, thread ${cur.codex.threadId}` : ''}. The user can watch and steer it in the Overseer panel. To continue this Codex session, call this tool again with resume: "${cur.name}".]`
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
-        await mut(a => patch(a, rec.id, r => ({ ...r, status: 'failed', endedAt: Date.now(), error: reason, activity: '' })))
-        return `Codex failed: ${reason}`
+        const isCancelled = reason === CANCELLED || reason === CLEARED
+        await mut(a => patch(a, rec.id, r => ({ ...r, status: isCancelled ? 'killed' : 'failed', endedAt: Date.now(), error: reason, activity: '' })))
+        return isCancelled ? reason : `Codex failed: ${reason}`
       } finally {
         signal?.removeEventListener('abort', onAbort)
       }
@@ -900,6 +1047,35 @@ export const register: Register = (on, options) => {
     const endAll = async () => {
       for (const p of procs.values()) p.stop?.()
       await saveHistory()
+    }
+
+    const fence = () => {
+      epoch++
+    }
+
+    const reset = async () => {
+      heldNotes.length = 0
+      liveBuf.clear()
+      draftBuf.clear()
+      savedHistory.clear()
+      overrideFailed.clear()
+      firstOfKind.clear()
+      hasAutoOpened = false
+      codexCounter = 0
+      await mut(() => ({}))
+      reviewCache = []
+      await Promise.all([
+        update($, 'outbox', () => []),
+        update($, 'reviews', () => []),
+        update($, 'drafts', () => ({})),
+        update($, 'ui', u => ({ isActiveOnly: u.isActiveOnly })),
+      ]).catch(() => undefined)
+      if (!hasState) {
+        courierDir = await makeCourierDir($)
+        if (courierDir !== '') await $.fs.write(`${courierDir}/outbox.json`, '[]').catch(() => undefined)
+      }
+      refreshStatus()
+      $.ui.invalidate('ui.render')
     }
 
     // ───────────────────────────── pane actions ─────────────────────────────
@@ -942,13 +1118,17 @@ export const register: Register = (on, options) => {
           const ui = await read($, 'ui')
           if (ui.isHistoryOpen === true) return setUi(u => ({ ...u, isHistoryOpen: false }))
           await saveHistory()
-          const history = (((await $.store.get('history')) ?? []) as HistoryItem[]).filter(item => !Object.values(cache).some(a => a.startedAt === item.startedAt && a.name === item.name))
+          const cutoff = Date.now() - opt.historyDays * 86_400_000
+          const history = (((await $.store.get('history')) ?? []) as HistoryItem[]).filter(
+            item => (item.endedAt ?? item.startedAt) >= cutoff && !Object.values(cache).some(a => a.startedAt === item.startedAt && a.name === item.name),
+          )
           await setUi(u => ({ ...u, isHistoryOpen: true, history }))
         })(),
       clearDone: () =>
         void (async () => {
           await saveHistory()
           await mut(a => Object.fromEntries(Object.entries(a).filter(([, r]) => isActive(r.status) || (r.kind === 'codex' && r.codex?.isAlive === true))))
+          for (const id of [...savedHistory]) if (cache[id] === undefined) savedHistory.delete(id)
           await setUi(u => (u.selected !== undefined && cache[u.selected] === undefined ? { ...u, selected: undefined } : u))
         })(),
       setModel: (id, value) =>
@@ -1057,7 +1237,7 @@ export const register: Register = (on, options) => {
       }
     }
 
-    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, codexTool, saveHistory, endAll, actions, debug, debugAt }
+    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, codexTool, saveHistory, endAll, fence, reset, actions, debug, debugAt }
 
     // ───────────────────────────── timers ─────────────────────────────
 
@@ -1169,10 +1349,22 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') ctl?.fence()
     await ctl?.endAll()
-    if (courierDir !== '') await $.process.run(['rm', '-rf', courierDir]).catch(() => undefined)
-    return next(e)
+    const dir = courierDir
+    courierDir = ''
+    await outboxWrites
+    if (dir !== '') await $.process.run(['rm', '-rf', dir]).catch(() => undefined)
+    const res = await next(e)
+    // a /clear goes on in this process under a new session id, with no session.start
+    if (e.reason === 'clear') await ctl?.reset().catch(() => undefined)
+    return res
   })
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    permissionMode = e.permission_mode
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // where the build has no $.session.append, notes for Claude go with the next prompt
   on('prompt.submit', async ($, e, next) => {
@@ -1199,7 +1391,8 @@ export const register: Register = (on, options) => {
       $.ui.toast(`Review the new ${e.subagentType} subagent in the Agents pane`)
       let decided: Review | undefined
       // 2.1.280 hands a hook no next.signal
-      while (next.signal?.aborted !== true) {
+      // /overseer off lets a held spawn go, as if approved
+      while (isEnabled && next.signal?.aborted !== true) {
         decided = reviewCache.find(r => r.id === review.id)
         if (decided?.decision !== undefined || Date.now() > review.deadline) break
         await $.process.run(['sleep', '0.3'])
@@ -1240,7 +1433,7 @@ export const register: Register = (on, options) => {
       await ctl.debugAt('step', id, e.index)
       if (cache[id]?.isPaused === true) {
         await ctl.mut(a => patch(a, id, r => ({ ...r, status: 'paused', activity: 'Paused before its next request' })))
-        while (cache[id]?.isPaused === true && cache[id]?.isStopping !== true && next.signal?.aborted !== true) await $.process.run(['sleep', '0.4'])
+        while (isEnabled && cache[id]?.isPaused === true && cache[id]?.isStopping !== true && next.signal?.aborted !== true) await $.process.run(['sleep', '0.4'])
       }
     } catch {
       // a failed pause never blocks the agent
@@ -1333,20 +1526,19 @@ export const register: Register = (on, options) => {
     return res
   }).catch(($, e, next) => next(e))
 
-  on('session.receive', async ($, e, next) => {
-    const id = e.agentId
-    if (id !== undefined && isEnabled && ctl !== undefined && cache[id] !== undefined) {
-      void ctl.mut(a => patch(a, id, r => ({ ...r, thread: r.thread.map(m => (m.by === 'user' && m.state === 'sent' ? { ...m, state: 'read' } : m)) })))
-    }
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
   // ───────────────────────────── tools ─────────────────────────────
 
+  // This hook answers the call itself, so the engine's permission step (beneath `next`)
+  // never runs: ask for the session's verdict here, and put an `ask` to the person.
   on('tool.call', { tool: CODEX_TOOL }, async ($, e, next) => {
     if (ctl === undefined) return { result: 'Overseer is still starting; try again in a moment.' }
     if (!isEnabled) return { result: 'Overseer is off for this session, so its Codex tool is unavailable. The user can turn it back on with /overseer on.' }
-    const input = e as unknown as CodexToolInput
+    const raw = e as unknown as CodexToolInput
+    const input: CodexToolInput = { prompt: raw.prompt, name: raw.name, model: raw.model, effort: raw.effort, cwd: raw.cwd, resume: raw.resume, background: raw.background }
+    const refusal = await codexPermission($, input, opt.codexSandbox).catch(
+      (err: unknown) => `Overseer could not check permission for Codex: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    if (refusal !== undefined) return { deny: refusal }
     const text = await ctl.codexTool(input, e.agentId, next.signal)
     return { result: text }
   }).catch(($, e, next) => ({ result: `Overseer's Codex tool failed: ${next.error?.message ?? 'unknown error'}` }))
@@ -1367,6 +1559,16 @@ export const register: Register = (on, options) => {
     if (arg === 'off' || arg === 'on') {
       isEnabled = arg === 'on'
       await update($, 'settings', s => ({ ...s, isEnabled }))
+      // a paused agent goes on when Overseer turns off, and a held spawn starts as approved;
+      // neither is held again if Overseer turns back on before its wait loop looks
+      if (!isEnabled) {
+        reviewCache = await update($, 'reviews', l => l.map(r => ({ ...r, decision: r.decision ?? 'approve' }))).catch(() => reviewCache.map(r => ({ ...r, decision: r.decision ?? ('approve' as const) })))
+        await ctl?.mut(a => {
+          let nx = a
+          for (const r of Object.values(a)) if (r.isPaused === true) nx = patch(nx, r.id, x => ({ ...x, isPaused: false, status: x.status === 'paused' ? 'running' : x.status, activity: '' }))
+          return nx
+        })
+      }
       $.ui.status(isEnabled ? undefined : 'off')
       return { text: isEnabled ? 'Overseer is on.' : 'Overseer is off for this session: every hook passes straight through. /overseer on turns it back on.' }
     }

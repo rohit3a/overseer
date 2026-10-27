@@ -29,7 +29,7 @@ const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: b
   }
   const session = { heard }
   let invalidates = 0
-  const seen = { get invalidates() { return invalidates }, steps: [] as { model: string; effort: unknown; agentId?: string }[], toasts: [] as string[], copied: [] as string[], status: [] as (string | undefined)[], sends: [] as string[] }
+  const seen = { get invalidates() { return invalidates }, steps: [] as { model: string; effort: unknown; agentId?: string }[], toasts: [] as string[], copied: [] as string[], status: [] as (string | undefined)[], sends: [] as string[], runs: [] as string[][] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__overseer__${e.name}` } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -52,6 +52,7 @@ const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: b
   // each one until the test lets it go, so waits are deterministic here
   const sleeps: (() => void)[] = []
   on('process.run', async ($, e) => {
+    seen.runs.push([...e.argv])
     if (e.argv[0] === 'sleep') await new Promise<void>(resolve => sleeps.push(resolve))
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -260,6 +261,88 @@ describe('control', () => {
     expect((denied as { deny?: string }).deny).toContain('mcp__overseer__codex')
     const allowed = await $.tool.call({ tool: 'Bash', tool_use_id: 'b2', command: 'echo codex is great' } as never)
     expect((allowed as { deny?: string }).deny).toBeUndefined()
+  })
+})
+
+describe('launch fixes', () => {
+  const CODEX = { tool: 'mcp__overseer__codex', tool_use_id: 'c1', prompt: 'Reply PONG', name: 'probe' } as never
+  const result = (r: unknown) => r as { deny?: string; result?: unknown }
+
+  test('the Codex tool honours a deny from the session permissions, and starts nothing', async ($, on) => {
+    const { seen } = world(on)
+    on('tool.check', () => ({ decision: 'deny', reason: 'Denied by rule mcp__overseer__codex' }))
+    await start($)
+    const r = result(await $.tool.call(CODEX))
+    expect(r.deny).toContain('Denied by rule')
+    expect(seen.runs.some(argv => argv.join(' ').includes('codex'))).toBe(false)
+  })
+
+  test('an ask with no one to answer it refuses the Codex tool', async ($, on) => {
+    world(on)
+    on('tool.check', () => ({ decision: 'ask' }))
+    on('tool.call', { tool: 'AskUserQuestion' }, () => ({ deny: 'no one to ask' }))
+    await start($)
+    const r = result(await $.tool.call(CODEX))
+    expect(r.deny).toContain('permission')
+  })
+
+  test('an allow lets the Codex tool go on to start Codex', async ($, on) => {
+    world(on)
+    on('session.cwd', () => ({ value: '/tmp/proj' }))
+    on('tool.check', () => ({ decision: 'allow' }))
+    await start($)
+    const r = result(await $.tool.call(CODEX))
+    expect(r.deny).toBeUndefined()
+    // the mock world has no real Codex: it fails past the permission check
+    expect(String(r.result)).toContain('Codex failed')
+  })
+
+  test('/overseer off lets a paused agent go', async ($, on) => {
+    const { seen, tick } = world(on)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    await drain($.turn.step(step(0)))
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    await ui.press({ key: 'row-a1' })
+    await ui.press({ key: 'pause-a1' })
+    let isDone = false
+    const pending = drain($.turn.step(step(1))).then(() => (isDone = true))
+    await tick(2)
+    expect(isDone).toBe(false)
+    await $.command.run({ command: 'overseer', args: 'off', origin: { kind: 'user' }, presentation: {} } as never)
+    await tick(2)
+    await pending
+    expect(seen.steps).toHaveLength(2)
+    // back on, it isn't held again
+    await $.command.run({ command: 'overseer', args: 'on', origin: { kind: 'user' }, presentation: {} } as never)
+    await drain($.turn.step(step(2)))
+    expect(seen.steps).toHaveLength(3)
+  })
+
+  test('two identical messages each get their own receipt', async ($, on) => {
+    world(on)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    await ui.press({ key: 'row-a1' })
+    await ui.input({ key: 'msg-a1-0', text: 'same' })
+    await ui.input({ key: 'msg-a1-1', text: 'same' })
+    const send = () => $.session.send({ to: 'a1', text: '[Message from the user, sent through the Overseer panel]\nsame', origin: { kind: 'plugin', name: 'overseer-courier' } } as never)
+    await Promise.all([send(), send()])
+    // the second one, shown under the box, was delivered too, not left sending
+    expect(await ui.find({ text: /^Sending…$/ })).toBeUndefined()
+    expect(await ui.find({ text: /^✓ Delivered/ })).toBeDefined()
+  })
+
+  test('/clear empties the pane for the next conversation', async ($, on) => {
+    world(on)
+    on('session.end', () => ({ sessionId: 'test-session' }) as never)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    expect(await ui.find({ key: 'row-a1' })).toBeDefined()
+    await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } } as never)
+    expect(await ui.find({ key: 'row-a1' })).toBeUndefined()
   })
 })
 
@@ -516,6 +599,19 @@ describe('spawn review', () => {
     await tick(2)
     expect((await second).deny).toContain('declined')
   })
+
+  if (hasTestOptions) test('/overseer off then on at once still lets a held spawn start', { options: { spawnReview: true, spawnReviewTimeoutSec: 60 }, timeoutMs: 20000 }, async ($, on) => {
+    const { tick } = world(on)
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    const held = $.agent.spawn(SPAWN)
+    for (let i = 0; i < 20 && (await ui.find({ key: 'review-ok-tu1' })) === undefined; i++) await tick()
+    // both before the wait loop looks again
+    await $.command.run({ command: 'overseer', args: 'off', origin: { kind: 'user' }, presentation: {} } as never)
+    await $.command.run({ command: 'overseer', args: 'on', origin: { kind: 'user' }, presentation: {} } as never)
+    await tick(2)
+    expect((await held).agentId).toBe('a1')
+  })
 })
 
 describe('pure logic', () => {
@@ -555,6 +651,15 @@ describe('pure logic', () => {
     expect(isRawCodexExec('cd a; codex e --json hi')).toBe(true)
     expect(isRawCodexExec('codex --version')).toBe(false)
     expect(isRawCodexExec('echo mycodex exec')).toBe(false)
+    expect(isRawCodexExec('env FOO=1 codex exec hi')).toBe(true)
+    expect(isRawCodexExec('env -i codex exec hi')).toBe(true)
+    expect(isRawCodexExec('sudo codex exec hi')).toBe(true)
+    expect(isRawCodexExec('nohup codex exec hi &')).toBe(true)
+    expect(isRawCodexExec('echo env codex exec')).toBe(false)
+    expect(isRawCodexExec("printf '%s\\n' 'Example; sudo codex exec task'")).toBe(false)
+    expect(isRawCodexExec('echo "a; codex exec b"')).toBe(false)
+    expect(isRawCodexExec("bash -lc 'codex exec fix'")).toBe(true)
+    expect(isRawCodexExec('codex exec "it; works"')).toBe(true)
   })
 
   test('models and registry', () => {

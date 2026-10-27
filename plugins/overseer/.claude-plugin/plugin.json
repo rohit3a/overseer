@@ -1,6 +1,6 @@
 {
   "name": "overseer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Watch and steer every subagent: live model and effort, change them mid-run, message running or finished agents, and run Codex as a steerable subagent.",
   "author": { "name": "rohit3a", "url": "https://github.com/rohit3a" },
   "license": "MIT",

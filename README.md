@@ -2,7 +2,7 @@
 
 Watch and steer every subagent Claude Code starts, from a live pane beside the chat.
 
-- **See** each subagent's model, effort, steps, tokens, live activity, the prompt its parent gave it, and its whole thread.
+- **See** each subagent's model, effort, steps, tokens, live activity, the prompt its parent gave it, and its thread (the latest 160 entries).
 - **Change model and effort mid-run.** The next request uses your choice.
 - **Message a running subagent.** It reads your message at its next step.
 - **Message a finished subagent.** It picks up again under the same id, with its history.
@@ -57,6 +57,16 @@ claude plugin install overseer-courier@overseer
 
 From a local clone, use `claude plugin marketplace add /path/to/overseer` instead. Sessions then read the plugins straight from that folder, so `/reload-plugins` picks up your edits.
 
+### Desktop app with an SSH host
+
+Install Overseer on the SSH host. If it is also installed on your local computer, the desktop app copies your local plugins to the host for each session, without their hooks, and that copy replaces the host's own install. Overseer then never appears in those sessions.
+
+To keep Overseer in local sessions too, load it on your computer from a clone instead of installing it, so the app does not copy it. Uninstall it there, then add this to the `env` block of `~/.claude/settings.json` on your computer:
+
+```json
+"CLAUDE_CODE_PLUGIN_DIRS": "/path/to/overseer/plugins/overseer:/path/to/overseer/plugins/overseer-courier"
+```
+
 ## Use
 
 The pane opens beside the chat when a subagent starts, unless you closed it yourself this session. While it's closed, a line above the message box shows `● 3 running · ✓ 2 finished` with an **Open Agents** button. `/overseer` toggles the pane too.
@@ -65,7 +75,7 @@ The pane opens beside the chat when a subagent starts, unless you closed it your
 |---|---|
 | `/overseer` | Open or close the Agents pane |
 | `/overseer off` / `on` | Make every hook a pass-through and disable the Codex tool for this session, or turn it back on |
-| `/overseer clear` | Remove finished agents from the pane (they stay in History) |
+| `/overseer clear` | Remove finished agents from the pane (they stay in History). A Codex agent stays while its process runs; **Quit Codex** first to clear it |
 | `/overseer history` | Finished agents from earlier sessions |
 
 Every agent is a card. Click anywhere on a closed card to open it, and **▲ Close** to close it again. One card is open at a time, with a blue border. Status shows in the label: Running blue, Done green, Paused yellow, Failed red. The elapsed clock ticks by itself, without redrawing the pane.
@@ -73,16 +83,18 @@ Every agent is a card. Click anywhere on a closed card to open it, and **▲ Clo
 In an open card:
 
 - **Model / Effort.** The dropdowns show what the agent runs on now ("· now"). Pick something else and it applies from the agent's next request ("→ Sonnet 5.5 from the next request"). Pick the "now" value again to cancel. Switching effort is cheap; switching model re-reads the context without the prompt cache.
-- **The latest 3 entries**, with long answers capped. **View transcript** opens the agent's whole thread in its own view, 25 entries at a time, with **▲ Load earlier** and **◀ Back**.
-- **Message box.** **Send** delivers to the agent and clears the box. A line under it tracks the message: Sending… → ✓ Delivered → ✓✓ Read by the agent, or ✗ Not delivered. A finished agent wakes up with your message. Past 30 characters, a wrapped preview of everything you've typed shows under the one-line box, capped at about five lines with the end in view. Overseer also adds a note to the main conversation, so Claude knows the message really came from you.
+- **The latest 3 entries**, with long answers capped. **View transcript** opens the agent's thread in its own view (the latest 160 entries, long entries capped at 12,000 characters), 25 entries at a time, with **▲ Load earlier** and **◀ Back**.
+- **Message box.** **Send** delivers to the agent and clears the box. A line under it tracks the message: Sending… → ✓ Delivered → ✓✓ Read by the agent (it made a request after the message arrived), or ✗ Not delivered. A finished agent wakes up with your message. Past 30 characters, a wrapped preview of everything you've typed shows under the one-line box, capped at about five lines with the end in view. Overseer also adds a note to the main conversation, so Claude knows the message really came from you.
 - **■ Stop** ends a Claude subagent at its next request, or interrupts a Codex turn. **Pause / Resume** hold a Claude subagent before its next request. For Codex it reads **■ Stop turn**; Codex agents also get **Apply now** (interrupt and continue with new settings) and **Quit Codex** (ends its process; a message starts it again).
 - **Broadcast** messages every running agent at once.
 
 ### Codex
 
-Overseer gives Claude a tool, `mcp__overseer__codex`. Ask Claude to delegate to Codex and it uses that tool. A raw `codex exec` in a shell is redirected there, so you can always see and steer the run.
+Overseer gives Claude a tool, `mcp__overseer__codex`. Ask Claude to delegate to Codex and it uses that tool. A raw `codex exec` in a shell is refused, and Claude is pointed at that tool instead, so you can always see and steer the run. The check catches the usual forms (`codex exec`, a full path, `npx`, `env`, `sudo`, flags before `exec`) but not every way of hiding a command; it keeps Claude on the tool, not a determined script.
 
-Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread. Codex runs with **full access** by default (`danger-full-access`, no approval prompts), the same power as a Claude subagent. Lower it in settings if you want.
+Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread. Codex runs with **full access** by default (`danger-full-access`, and Codex itself asks for no approvals). Lower it in settings if you want.
+
+Each call of the Codex tool goes through your session's permissions first, like any other tool: an allow rule or a permissive mode runs it, a deny rule refuses it, and otherwise you're asked once per call. With no one to ask (a `-p` run in a mode that would prompt), the call is refused. To let it run unattended, allow `mcp__overseer__codex` in your permission settings. Two limits: `PreToolUse` command hooks in settings files don't see Codex tool calls (rules, the mode and plugin permission hooks do), and on a build without plugin permission checks (2.1.280) the Codex tool refuses to run.
 
 ## Settings
 
@@ -98,7 +110,7 @@ Change these in `/config` → overseer, or with `claude plugin configure oversee
 | `codexPath` | auto | Absolute path to `codex`. Auto checks `~/.local/bin`, then `PATH`, then a login shell (finds nvm installs) |
 | `spawnReview` | off | Hold each new subagent for approve / edit / deny |
 | `spawnReviewTimeoutSec` | 90 | An unanswered review approves itself |
-| `historyDays` | 7 | How long finished agents stay in History |
+| `historyDays` | 7 | How long finished agents stay in History. The pane itself keeps the latest 50 finished agents; older ones move to History |
 
 ## How it works
 
@@ -115,9 +127,9 @@ Overseer uses Claude Code's function-hook plugin API (early access):
 
 **Why two plugins:** a plugin never sees the requests of an agent its own call resumed. So Overseer queues your messages, and `overseer-courier` sends them from its own timer. That keeps Overseer able to watch and steer the agent your message woke up.
 
-All state lives in host-held plugin state, so the pane survives `/reload-plugins` and hot reloads mid-run. Every hook fails open: if Overseer breaks, Claude carries on as if it weren't installed.
+All state lives in host-held plugin state, so the pane survives `/reload-plugins` and hot reloads mid-run. Every hook fails open: if Overseer breaks, Claude carries on as if it weren't installed. `/overseer off` lets paused agents and held spawn reviews go at once. The one exception is the Codex tool: if its permission check fails, the call is refused rather than run.
 
-Claude Code 2.1.280 has no host-held state, so there Overseer keeps its state in memory for the session, and a reload starts it over. Overseer and the courier pass messages through files in a temporary folder, removed when the session ends. That build can't add a note to the conversation either, so the note about a message you sent a subagent goes in front of your next prompt. Closed cards show their summary as plain text.
+Claude Code 2.1.280 has no host-held state, so there Overseer keeps its state in memory for the session, and a reload starts it over. Overseer and the courier pass messages through files in a temporary folder that only your user can enter (mode 700; a path someone else created first is refused), removed when the session ends. That build can't add a note to the conversation either, so the note about a message you sent a subagent goes in front of your next prompt. Closed cards show their summary as plain text.
 
 ## Platforms
 
