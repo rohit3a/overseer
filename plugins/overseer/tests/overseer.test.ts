@@ -12,7 +12,7 @@ const paneProps = (bodyColumns = 64) =>
   ({ title: 'Agents', isFocused: false, bodyColumns, placement: 'dock', bodyRows: 40 }) as never
 
 // the world beneath the plugin: everything it calls, answered plainly
-const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: boolean; chunks?: unknown[]; hold?: Promise<void>; isPaneShown?: boolean; env?: Record<string, string> } = {}) => {
+const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: boolean; chunks?: unknown[]; hold?: Promise<void>; isPaneShown?: boolean; env?: Record<string, string>; countWrites?: boolean } = {}) => {
   const clock = mock.clock(on, { now: Date.now() })
   mock.store(on)
   mock.env(on, { HOME: '/tmp', PATH: '/usr/bin:/bin', TMPDIR: '/tmp', ...extra.env })
@@ -30,7 +30,8 @@ const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: b
   const session = { heard }
   let invalidates = 0
   let agentWrites = 0
-  on('state.set', ($, e, next) => (e.plugin === 'overseer' && e.key === 'agents' && agentWrites++, next(e)))
+  // a state.set hook puts every write through the hook chain, which slows a big test several times over: only where counted
+  if (extra.countWrites === true) on('state.set', ($, e, next) => (e.plugin === 'overseer' && e.key === 'agents' && agentWrites++, next(e)))
   let opens = 0
   const seen = { get invalidates() { return invalidates }, get agentWrites() { return agentWrites }, get opens() { return opens }, steps: [] as { model: string; effort: unknown; agentId?: string }[], toasts: [] as string[], copied: [] as string[], status: [] as (string | undefined)[], sends: [] as string[], runs: [] as string[][] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -535,7 +536,7 @@ describe('speed', () => {
   test('streamed text updates the activity line on the surface, with no pane redraw', async ($, on) => {
     let release = () => {}
     const hold = new Promise<void>(resolve => (release = resolve))
-    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold })
+    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold, countWrites: true })
     await start($)
     await $.agent.spawn(SPAWN)
     const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
@@ -558,7 +559,7 @@ describe('surfaces without live lines', () => {
   test('VS Code shows streamed text from its own value, not from agent writes', async ($, on) => {
     let release = () => {}
     const hold = new Promise<void>(resolve => (release = resolve))
-    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold })
+    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold, countWrites: true })
     await start($)
     await $.agent.spawn(SPAWN)
     const ui = await $.ui.mount({ plugin: 'overseer', surface: 'vscode', component: 'Pane', requestId: 'overseer', props: paneProps() })
