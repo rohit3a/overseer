@@ -26,7 +26,8 @@ export const modelLabel = (id: string | undefined): string => {
   const known = CLAUDE_MODELS.find(m => m.id === id)
   if (known !== undefined) return known.label
   const m = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(id)
-  if (m !== null) return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}`
+  const [, family = '', major, minor] = m ?? []
+  if (m !== null) return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${major}.${minor}`
   return id
 }
 

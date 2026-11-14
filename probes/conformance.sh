@@ -44,7 +44,7 @@ command -v codex >/dev/null 2>&1 && echo "codex: $(codex --version 2>/dev/null)"
 run() { # name, debug script, allowed tools, prompt
   name=$1; script=$2; tools=$3; prompt=$4
   dir="$work/$name"; mkdir -p "$dir"
-  ( cd "$dir" && OVERSEER_DEBUG_FILE="$dir/trace.json" OVERSEER_DEBUG_SCRIPT="$script" \
+  ( cd "$dir" && OVERSEER_DEBUG_FILE="$dir/trace.json" OVERSEER_DEBUG_SCRIPT="$script" OVERSEER_CODEX_IDLE_MS="${idle_ms:-}" \
       claude -p $plugins --model haiku --allowedTools $tools -- "$prompt" >"$dir/out.txt" 2>"$dir/err.txt" ) || true
   python3 -I "$here/check.py" "$name" "$dir" || fail=1
 }
@@ -77,6 +77,12 @@ if [ "$skip_codex" = 0 ]; then
     {"kind":"codex","at":"tool","op":"applyNow"}
   ]' "mcp__overseer__codex" \
 "Call the mcp__overseer__codex tool once with name 'apply-codex' and prompt: 'Run these shell commands one at a time as separate commands: echo A; sleep 4; echo B. Then reply with the letters you saw.' Then reply FINISHED and quote the Codex reply."
+
+  # a short idle limit: the process quits between the two calls, and the second resumes the thread
+  idle_ms=3000
+  run codexidle '[]' "mcp__overseer__codex Bash(sleep:*)" \
+"Call the mcp__overseer__codex tool with name 'idle-a' and prompt: 'Reply with exactly ONE.' When it returns, run Bash: sleep 10. Then call the mcp__overseer__codex tool with resume 'idle-a' and prompt: 'Reply with exactly TWO.' Then reply FINISHED and quote both Codex replies."
+  idle_ms=""
 
   run codex '[
     {"kind":"codex","at":"tool","op":"send","value":"Change of plan: stop running commands now and reply with exactly STEERED."},

@@ -7,6 +7,7 @@ Watch and steer every subagent Claude Code starts, from a live pane beside the c
 - **Message a running subagent.** It reads your message at its next step.
 - **Message a finished subagent.** It picks up again under the same id, with its history.
 - **Pause and resume** a subagent before its next request.
+- **Show in chat** puts a Claude subagent's own transcript in the main view.
 - **Run Codex as a real subagent** you can watch live, steer mid-turn, re-tune, and continue later.
 - Optional **spawn review**: approve, edit or deny each subagent's prompt before it starts.
 
@@ -78,21 +79,21 @@ The pane opens beside the chat when a subagent starts, unless you closed it your
 | `/overseer clear` | Remove finished agents from the pane (they stay in History). A Codex agent stays while its process runs; **Quit Codex** first to clear it |
 | `/overseer history` | Finished agents from earlier sessions |
 
-Every agent is a card. Click anywhere on a closed card to open it, and **▲ Close** to close it again. One card is open at a time, with a blue border. Status shows in the label: Running blue, Done green, Paused yellow, Failed red. The elapsed clock ticks by itself, without redrawing the pane.
+Every agent is a card. Click anywhere on a closed card to open it, and **▲ Close** to close it again. One card is open at a time, with a blue border. Status shows in the label: Running blue, Done green, Paused yellow, Failed red. The elapsed clock and the live activity line update by themselves, without redrawing the pane, so clicks never land mid-redraw. Close the pane and it stays closed for the session, even as new agents start; `/overseer` or **Open Agents** above the prompt brings it back.
 
 In an open card:
 
 - **Model / Effort.** The dropdowns show what the agent runs on now ("· now"). Pick something else and it applies from the agent's next request ("→ Sonnet 5.5 from the next request"). Pick the "now" value again to cancel. Switching effort is cheap; switching model re-reads the context without the prompt cache.
 - **The latest 3 entries**, with long answers capped. **View transcript** opens the agent's thread in its own view (the latest 160 entries, long entries capped at 12,000 characters), 25 entries at a time, with **▲ Load earlier** and **◀ Back**.
 - **Message box.** **Send** delivers to the agent and clears the box. A line under it tracks the message: Sending… → ✓ Delivered → ✓✓ Read by the agent (it made a request after the message arrived), or ✗ Not delivered. A finished agent wakes up with your message. Past 30 characters, a wrapped preview of everything you've typed shows under the one-line box, capped at about five lines with the end in view. Overseer also adds a note to the main conversation, so Claude knows the message really came from you.
-- **■ Stop** ends a Claude subagent at its next request, or interrupts a Codex turn. **Pause / Resume** hold a Claude subagent before its next request. For Codex it reads **■ Stop turn**; Codex agents also get **Apply now** (interrupt and continue with new settings) and **Quit Codex** (ends its process; a message starts it again).
+- **■ Stop** ends a Claude subagent at its next request, or interrupts a Codex turn. **Pause / Resume** hold a Claude subagent before its next request. **Show in chat** switches the main view to a Claude subagent's transcript, in the terminal and the desktop app. For Codex it reads **■ Stop turn**; Codex agents also get **Apply now** (the running turn switches to the new model and effort in place; on a Codex without that, it is interrupted and continued with them) and **Quit Codex** (takes the agent off Codex; a message picks its thread up again).
 - **Broadcast** messages every running agent at once.
 
 ### Codex
 
 Overseer gives Claude a tool, `mcp__overseer__codex`. Ask Claude to delegate to Codex and it uses that tool. A raw `codex exec` in a shell is refused, and Claude is pointed at that tool instead, so you can always see and steer the run. The check catches the usual forms (`codex exec`, a full path, `npx`, `env`, `sudo`, flags before `exec`) but not every way of hiding a command; it keeps Claude on the tool, not a determined script.
 
-Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread, and Claude can continue one from an earlier session too, by the agent's name or its thread id. Ask for Codex's fast tier per call (`fast: true`) or for every run with `codexFast`. Codex runs with **full access** by default (`danger-full-access`, and Codex itself asks for no approvals). Lower it in settings if you want.
+Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridge, which gives true mid-turn steering, live streaming, and per-turn model and effort. A follow-up after Codex finishes continues the same thread, and Claude can continue one from an earlier session too, by the agent's name or its thread id. Ask for Codex's fast tier per call (`fast: true`) or for every run with `codexFast`. All Codex agents share one `app-server` process, which quits after 5 minutes with no turn running; the next message starts it again and resumes the agent's thread where it left off. Codex runs with **full access** by default (`danger-full-access`, and Codex itself asks for no approvals). Lower it in settings if you want.
 
 Each call of the Codex tool goes through your session's permissions first, like any other tool: an allow rule or a permissive mode runs it, a deny rule refuses it, and otherwise you're asked once per call. With no one to ask (a `-p` run in a mode that would prompt), the call is refused. To let it run unattended, allow `mcp__overseer__codex` in your permission settings. Two limits: `PreToolUse` command hooks in settings files don't see Codex tool calls (rules, the mode and plugin permission hooks do), and on a build without plugin permission checks (2.1.280) the Codex tool refuses to run.
 
@@ -115,6 +116,8 @@ Change these in `/config` → overseer, or with `claude plugin configure oversee
 
 ## How it works
 
+**Light on the machine.** With no agents Overseer's timers return at once. While agents stream, nothing is written for the pane where the terminal or desktop app draws it (the lines ask for their own text). Every Codex agent shares one Codex process, and it quits after 5 idle minutes. While it runs, the bridge sleeps 2 s at a time when idle (a signal wakes it at once for a request), and Codex is asked not to send command-output and diff streams Overseer never shows. Threads and history are capped.
+
 Overseer uses Claude Code's function-hook plugin API (early access):
 
 | Hook | Used for |
@@ -126,7 +129,7 @@ Overseer uses Claude Code's function-hook plugin API (early access):
 | `ui.render` on `Pane` | The pane, one view for terminal, desktop, VS Code and mobile (mobile has buttons but no text fields or dropdowns) |
 | `ui.render` on `AbovePrompt` | The one-line band that reopens the pane |
 
-**Why two plugins:** a plugin never sees the requests of an agent its own call resumed. So Overseer queues your messages, and `overseer-courier` sends them from its own timer. That keeps Overseer able to watch and steer the agent your message woke up.
+**Why two plugins:** a plugin never sees the requests of an agent its own call resumed. So Overseer queues your messages, and `overseer-courier` sends them from its own frame, as soon as Overseer writes the queue (a timer catches anything missed across a reload). That keeps Overseer able to watch and steer the agent your message woke up.
 
 All state lives in host-held plugin state, so the pane survives `/reload-plugins` and hot reloads mid-run. Every hook fails open: if Overseer breaks, Claude carries on as if it weren't installed. `/overseer off` lets paused agents and held spawn reviews go at once. The one exception is the Codex tool: if its permission check fails, the call is refused rather than run.
 
@@ -138,11 +141,11 @@ Checked by hand with the conformance suite below (CI runs only the no-API-key ch
 
 | Machine | Result |
 |---|---|
-| macOS 26 (arm64), Claude Code 2.1.299, Codex 0.162 | all checks pass |
-| Ubuntu (x86_64), Claude Code 2.1.296, Codex 0.159 and 0.162 | all checks pass |
+| macOS 26 (arm64), Claude Code 2.1.318, Codex 0.167 | all checks pass |
+| Ubuntu 26.04 (x86_64, `sh` is dash), Claude Code 2.1.319, Codex 0.167 | all checks pass |
 | Ubuntu (x86_64), Claude Code 2.1.280, 2.1.304 and 2.1.306 | `scripts/check.sh` passes. 2.1.280's test kit ignores a test's own settings, so the spawn review test runs only on the newer two. On 2.1.280 a live session was also checked by hand: the pane, the band and a subagent tracked to the end. The conformance suite and Codex were not run there. |
 
-Windows is untested and expected to need WSL: pause and spawn review wait on the `sleep` command, and the Codex bridge needs `sh` and `mkfifo`.
+**Windows:** use Claude Code inside WSL, where Overseer runs as on Linux. Native Windows is not supported: the Codex bridge needs a POSIX shell, FIFOs and signals, so there the Codex tool refuses with a pointer to WSL (and raw `codex exec` is left alone), and pause and spawn review wait on `sleep`.
 
 ## Develop
 

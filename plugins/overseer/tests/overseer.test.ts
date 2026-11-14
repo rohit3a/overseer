@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { LineBuffer } from '../src/codex/bridge'
-import { isRawCodexExec, parseLine, parseModels, turnStart, unwrapShell } from '../src/codex/protocol'
+import { declineFor, initialize, isRawCodexExec, parseLine, parseModels, turnStart, unwrapShell } from '../src/codex/protocol'
 import { completed, newRecord, ordered, stepEnded, stepStarted, toHistory, toolLine, withMsg } from '../src/registry'
 import { modelLabel, resolveModel } from '../src/models'
 
@@ -12,10 +12,10 @@ const paneProps = (bodyColumns = 64) =>
   ({ title: 'Agents', isFocused: false, bodyColumns, placement: 'dock', bodyRows: 40 }) as never
 
 // the world beneath the plugin: everything it calls, answered plainly
-const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: boolean } = {}) => {
+const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: boolean; chunks?: unknown[]; hold?: Promise<void>; isPaneShown?: boolean; env?: Record<string, string> } = {}) => {
   const clock = mock.clock(on, { now: Date.now() })
   mock.store(on)
-  mock.env(on, { HOME: '/tmp', PATH: '/usr/bin:/bin', TMPDIR: '/tmp' })
+  mock.env(on, { HOME: '/tmp', PATH: '/usr/bin:/bin', TMPDIR: '/tmp', ...extra.env })
   // what Claude is told: rows appended to the conversation where the build has
   // $.session.append (and its kit mock.session), else the next prompt as it arrives
   const rows = typeof mock.session === 'function' ? mock.session(on) : undefined
@@ -29,20 +29,23 @@ const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: b
   }
   const session = { heard }
   let invalidates = 0
-  const seen = { get invalidates() { return invalidates }, steps: [] as { model: string; effort: unknown; agentId?: string }[], toasts: [] as string[], copied: [] as string[], status: [] as (string | undefined)[], sends: [] as string[], runs: [] as string[][] }
+  let agentWrites = 0
+  on('state.set', ($, e, next) => (e.plugin === 'overseer' && e.key === 'agents' && agentWrites++, next(e)))
+  let opens = 0
+  const seen = { get invalidates() { return invalidates }, get agentWrites() { return agentWrites }, get opens() { return opens }, steps: [] as { model: string; effort: unknown; agentId?: string }[], toasts: [] as string[], copied: [] as string[], status: [] as (string | undefined)[], sends: [] as string[], runs: [] as string[][] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('tool.register', ($, e) => ({ value: { tool: `mcp__overseer__${e.name}` } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.status', ($, e) => (seen.status.push(e.text), { value: undefined }))
   on('ui.toast', ($, e) => (seen.toasts.push(e.text), { value: undefined }))
-  on('ui.open', () => ({ value: extra.isPlaced === false ? { isPlaced: false, reason: 'narrow' } : { isPlaced: true } }) as never)
+  on('ui.open', () => (opens++, { value: extra.isPlaced === false ? { isPlaced: false, reason: 'narrow' } : { isPlaced: true } }) as never)
   // the engine's own band, when no plugin draws one: an empty box
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box } = $.ui.resolve(e) as unknown as { Box: never }
     return h(Box, {}) as never
   })
   on('ui.close', () => ({ value: undefined }))
-  on('ui.panes', () => ({ value: [] }))
+  on('ui.panes', () => ({ value: extra.isPaneShown === true ? [{ id: 'overseer', title: 'Agents', isShown: true, isFocused: false, isPlaced: true }] : [] }) as never)
   on('ui.invalidate', ($, e, next) => (invalidates++, next(e)))
   on('ui.copy', ($, e) => (seen.copied.push(e.text), { value: { isCopied: true } }) as never)
   on('agent.list', () => ({ value: [] }))
@@ -68,6 +71,8 @@ const world = (on: On, extra: { onSpawn?: (prompt: string) => void; isPlaced?: b
   on('session.send', ($, e) => (seen.sends.push(e.text), { isDelivered: true }))
   on('turn.step', async function* ($, e) {
     seen.steps.push({ model: e.model, effort: e.effort, agentId: e.agentId })
+    for (const chunk of extra.chunks ?? []) yield chunk as never
+    if (extra.hold !== undefined) await extra.hold
     return { turnId: e.turnId, index: e.index, answer: 'working', toolUses: [{ name: 'Bash', input: { command: 'echo one' } }], stopReason: 'tool_use', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: e.model } } as never
   })
   on('turn.complete', ($, e) => ({ text: e.answer }))
@@ -302,6 +307,19 @@ describe('launch fixes', () => {
     expect(String(r.result)).toContain('Codex failed')
   })
 
+  test('native Windows refuses the Codex tool with a pointer to WSL, and leaves raw codex alone', async ($, on) => {
+    const { seen } = world(on, { env: { OS: 'Windows_NT' } })
+    on('session.cwd', () => ({ value: 'C:/proj' }))
+    on('tool.check', () => ({ decision: 'allow' }))
+    on('tool.call', { tool: 'Bash' }, () => ({ result: 'ran' }))
+    await start($)
+    const r = result(await $.tool.call(CODEX))
+    expect(String(r.result)).toContain('WSL')
+    expect(seen.runs.some(argv => argv.join(' ').includes('codex'))).toBe(false)
+    const raw = result(await $.tool.call({ tool: 'Bash', tool_use_id: 'b1', command: 'codex exec "fix it"' } as never))
+    expect(raw.deny).toBeUndefined()
+  })
+
   test('/overseer off lets a paused agent go', async ($, on) => {
     const { seen, tick } = world(on)
     await start($)
@@ -513,7 +531,67 @@ describe('smoothness', () => {
   })
 })
 
+describe('speed', () => {
+  test('streamed text updates the activity line on the surface, with no pane redraw', async ($, on) => {
+    let release = () => {}
+    const hold = new Promise<void>(resolve => (release = resolve))
+    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold })
+    await start($)
+    await $.agent.spawn(SPAWN)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    const running = drain($.turn.step(step(0)))
+    await clock.advance(400)
+    // the line asks for its text, and from then on streaming writes nothing
+    await ui.advance(350)
+    const before = seen.agentWrites
+    await clock.advance(2000)
+    await ui.advance(700)
+    expect(seen.agentWrites - before).toBe(0)
+    expect(await ui.find({ in: 'live-a1', text: /Reading the config files/ })).toBeDefined()
+    release()
+    await running
+    await clock.advance(400)
+  })
+})
+
+describe('surfaces without live lines', () => {
+  test('VS Code shows streamed text from its own value, not from agent writes', async ($, on) => {
+    let release = () => {}
+    const hold = new Promise<void>(resolve => (release = resolve))
+    const { seen, clock } = world(on, { chunks: [{ kind: 'text', index: 0, text: 'Reading the config files' }], hold })
+    await start($)
+    await $.agent.spawn(SPAWN)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'vscode', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    const running = drain($.turn.step(step(0)))
+    await clock.advance(400)
+    const before = seen.agentWrites
+    await clock.advance(1000)
+    expect(seen.agentWrites - before).toBe(0)
+    expect(await ui.find({ text: /Reading the config files/ })).toBeDefined()
+    release()
+    await running
+    await clock.advance(400)
+  })
+})
+
 describe('getting back to the pane', () => {
+  test('closing the pane keeps it closed for new agents until the person opens it', async ($, on) => {
+    const { seen } = world(on, { isPaneShown: true })
+    await start($)
+    await $.agent.spawn(SPAWN)
+    expect(seen.opens).toBe(1)
+    // the kit can't press the engine's close mark; /overseer closes the open pane the same way
+    await $.command.run({ command: 'overseer', args: '', origin: { kind: 'user' }, presentation: {} } as never)
+    await $.agent.spawn({ ...(SPAWN as object), tool_use_id: 'tu2', description: 'second worker' } as never)
+    expect(seen.opens).toBe(1)
+    await $.command.run({ command: 'overseer', args: 'on', origin: { kind: 'user' }, presentation: {} } as never)
+    await $.command.run({ command: 'overseer', args: 'history', origin: { kind: 'user' }, presentation: {} } as never)
+    expect(seen.opens).toBe(2)
+    // opened again by the person: new agents may open it once more after it closes
+    await $.agent.spawn({ ...(SPAWN as object), tool_use_id: 'tu3', description: 'third worker' } as never)
+  })
+
+
   test('a band above the prompt offers the pane while it is not showing', async ($, on) => {
     world(on, { isPlaced: false })
     await start($)
@@ -567,6 +645,26 @@ describe('the remaining controls', () => {
     expect(seen.copied).toEqual(['a1'])
     expect(seen.toasts.some(t => t.includes('Copied a1'))).toBe(true)
   })
+
+  test('Show in chat puts a Claude subagent in the main view, and says why when it cannot', async ($, on) => {
+    const { seen } = world(on)
+    const viewed: (string | undefined)[] = []
+    let deny: string | undefined
+    on('ui.view', ($, e) => (viewed.push(e.agentId), { value: deny === undefined ? {} : { deny } }) as never)
+    await start($)
+    await $.agent.spawn(SPAWN as never)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    await ui.press({ key: 'row-a1' })
+    await ui.press({ key: 'view-a1' })
+    expect(viewed).toEqual(['a1'])
+    deny = 'the session draws none'
+    await ui.press({ key: 'view-a1' })
+    expect(seen.toasts.some(t => t.includes('the session draws none'))).toBe(true)
+    // mobile has no main view to switch (the card is still open there: the selection is shared)
+    const phone = await $.ui.mount({ plugin: 'overseer', surface: 'mobile', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    expect(await phone.find({ key: 'copy-a1' })).toBeDefined()
+    expect(await phone.find({ key: 'view-a1' })).toBeUndefined()
+  })
 })
 
 // 2.1.280's kit ignores a test's `options`, so spawnReview can't be switched on
@@ -605,6 +703,20 @@ describe('spawn review', () => {
     expect((await second).deny).toContain('declined')
   })
 
+  if (hasTestOptions) test('a /clear while a spawn waits for review drops it instead of starting it later', { options: { spawnReview: true, spawnReviewTimeoutSec: 60 }, timeoutMs: 20000 }, async ($, on) => {
+    const { tick } = world(on)
+    on('session.end', () => ({ sessionId: 'test-session' }) as never)
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    const held = $.agent.spawn(SPAWN)
+    for (let i = 0; i < 20 && (await ui.find({ key: 'review-ok-tu1' })) === undefined; i++) await tick()
+    await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } } as never)
+    await tick(2)
+    const res = (await held) as { deny?: string; agentId?: string }
+    expect(res.deny).toMatch(/cleared/)
+    expect(res.agentId).toBeUndefined()
+  })
+
   if (hasTestOptions) test('/overseer off then on at once still lets a held spawn start', { options: { spawnReview: true, spawnReviewTimeoutSec: 60 }, timeoutMs: 20000 }, async ($, on) => {
     const { tick } = world(on)
     await start($)
@@ -625,14 +737,22 @@ describe('pure logic', () => {
     expect(parseLine('{"method":"turn/started","params":{"turn":{"id":"T"}}}')).toEqual({ kind: 'turnStarted', turnId: 'T' })
     expect(parseLine('{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"/bin/zsh -lc \'echo A\'","exitCode":0}}}')).toEqual({ kind: 'tool', text: '$ echo A' })
     expect(parseLine('{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"false","exitCode":1}}}')).toEqual({ kind: 'tool', text: '$ false  (exit 1)' })
-    expect(parseLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"PONG"}}}')).toEqual({ kind: 'message', text: 'PONG' })
+    expect(parseLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"PONG"}}}')).toEqual({ kind: 'message', text: 'PONG', isFinal: false })
+    expect(parseLine('{"method":"item/completed","params":{"threadId":"th","item":{"type":"agentMessage","text":"Done.","phase":"final_answer"}}}')).toEqual({ kind: 'message', text: 'Done.', isFinal: true, threadId: 'th' })
+    // a sub-agent's events carry their own thread
+    expect(parseLine('{"method":"turn/started","params":{"threadId":"sub","turn":{"id":"T2"}}}')).toEqual({ kind: 'turnStarted', turnId: 'T2', threadId: 'sub' })
+    expect(parseLine('{"method":"item/started","params":{"item":{"type":"webSearch","query":"","action":{"type":"search","query":"codex app-server"}}}}')).toEqual({ kind: 'activity', text: 'Search: codex app-server' })
+    expect(parseLine('{"method":"turn/plan/updated","params":{"plan":[{"step":"Read","status":"completed"},{"step":"Fix the parser","status":"inProgress"}]}}')).toEqual({ kind: 'activity', text: 'Plan 1/2: Fix the parser' })
+    expect(parseLine('{"method":"item/reasoning/summaryTextDelta","params":{"itemId":"r1","delta":"Checking"}}')).toEqual({ kind: 'thinking', text: 'Checking', itemId: 'r1:0' })
+    expect(declineFor('item/commandExecution/requestApproval')).toEqual({ result: { decision: 'decline' } })
+    expect(declineFor('something/else')).toBeUndefined()
     expect(parseLine('{"method":"turn/completed","params":{"turn":{"id":"T","status":"interrupted"}}}')).toEqual({ kind: 'turnCompleted', turnId: 'T', status: 'interrupted', error: undefined })
     expect(parseLine('not json')).toEqual({ kind: 'ignore' })
     expect(parseLine('{"id":7,"method":"mcpServer/elicitation/request","params":{}}')).toEqual({ kind: 'serverRequest', id: 7, method: 'mcpServer/elicitation/request' })
     expect(parseLine('{"method":"item/completed","params":{"item":{"type":"mcpToolCall","server":"s","tool":"t","status":"failed"}}}')).toEqual({ kind: 'tool', text: 's:t  (failed)' })
     expect(unwrapShell(`/bin/bash -lc 'ls -la'`)).toBe('ls -la')
     expect(parseModels({ data: [{ id: 'm1', displayName: 'M1', supportedReasoningEfforts: [{ reasoningEffort: 'low' }], isDefault: true }, { id: 'h', hidden: true }] })).toEqual([
-      { id: 'm1', label: 'M1', efforts: ['low'], isDefault: true },
+      { id: 'm1', label: 'M1', efforts: ['low'], isDefault: true, fastTier: undefined },
     ])
   })
 
@@ -698,9 +818,17 @@ describe('pure logic', () => {
     expect(toHistory(rec)).toMatchObject({ name: 'audit', threadId: 'th-1', cwd: '/w' })
   })
 
+  test('initialize opts out of the output streams Overseer never reads', () => {
+    const caps = (initialize(1).params as { capabilities: { optOutNotificationMethods: string[]; experimentalApi: boolean } }).capabilities
+    expect(caps.experimentalApi).toBe(true)
+    expect(caps.optOutNotificationMethods).toContain('item/commandExecution/outputDelta')
+    expect(parseModels({ data: [{ id: 'g', serviceTiers: [{ id: 'priority', name: 'Fast' }] }] })[0]?.fastTier).toBe('priority')
+  })
+
   test('turn/start asks for the speed tier only when one was chosen', () => {
     const tier = (isFast?: boolean) => (turnStart(1, { threadId: 't', text: 'x', isFast }).params as { serviceTierForTurn: unknown }).serviceTierForTurn
-    expect(tier(true)).toBe('fast')
+    expect(tier(true)).toBe('priority')
+    expect((turnStart(1, { threadId: 't', text: 'x', isFast: true, fastTier: 'turbo' }).params as { serviceTierForTurn: unknown }).serviceTierForTurn).toBe('turbo')
     expect(tier(false)).toBe('default')
     expect(tier(undefined)).toBe(null)
   })

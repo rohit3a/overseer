@@ -5,29 +5,46 @@
 // in order, through a FIFO into `codex app-server`.
 //
 // `exec` makes codex the process the mod holds, so ending the mod's stream
-// kills codex itself; the feeder loop exits when codex is gone (`kill -0 $pid`)
+// kills codex itself; the feeder exits when codex is gone (`kill -0 $pid`)
 // or a `quit` file appears, and stops codex if Claude Code itself disappears.
+//
+// The feeder is light while Codex idles: it checks every 50 ms for a second
+// after a request, then every 2 s, and a SIGUSR1 (wakeBridge) wakes it at once,
+// so a request never waits on the slow beat. It writes its pid to `$inbox/feeder.pid` once it can take the signal.
+export const FEEDER_SCRIPT = `inbox=$1 pid=$2 host=$3
+woke=0 sp= idle=0
+trap 'woke=1; [ -n "$sp" ] && kill "$sp" 2>/dev/null' USR1
+# the pid goes out only once the trap is set: an earlier signal would kill the feeder
+echo $$ > "$inbox/feeder.pid.tmp" && mv "$inbox/feeder.pid.tmp" "$inbox/feeder.pid"
+while :; do
+  found=0
+  for ok in "$inbox"/*.ok; do
+    [ -e "$ok" ] || continue
+    found=1
+    f="\${ok%.ok}.json"
+    [ -e "$f" ] && cat "$f"
+    rm -f "$f" "$ok"
+  done
+  [ -e "$inbox/quit" ] && exit 0
+  kill -0 "$pid" 2>/dev/null || exit 0
+  # Claude Code itself is gone (crashed, force-quit): take codex down too
+  kill -0 "$host" 2>/dev/null || { kill "$pid" 2>/dev/null; exit 0; }
+  if [ "$found" = 1 ]; then idle=0; else idle=$((idle + 1)); fi
+  if [ "$woke" = 1 ]; then woke=0; continue; fi
+  if [ "$idle" -lt 20 ]; then t=0.05; else t=2; fi
+  sleep "$t" & sp=$!
+  # a wake that landed before $sp was set: don't sleep through it
+  if [ "$woke" = 1 ]; then woke=0; kill "$sp" 2>/dev/null; fi
+  wait "$sp" 2>/dev/null
+  sp=
+done
+`
+
 export const BRIDGE_SCRIPT = `inbox=$1; shift
 pipe="$inbox/pipe"
 rm -f "$pipe"
 mkfifo "$pipe" || { echo "overseer: mkfifo failed" >&2; exit 97; }
-pid=$$
-host=$PPID
-(
-  while :; do
-    for ok in "$inbox"/*.ok; do
-      [ -e "$ok" ] || continue
-      f="\${ok%.ok}.json"
-      [ -e "$f" ] && cat "$f"
-      rm -f "$f" "$ok"
-    done
-    [ -e "$inbox/quit" ] && exit 0
-    kill -0 "$pid" 2>/dev/null || exit 0
-    # Claude Code itself is gone (crashed, force-quit): take codex down too
-    kill -0 "$host" 2>/dev/null || { kill "$pid" 2>/dev/null; exit 0; }
-    sleep 0.05
-  done
-) > "$pipe" &
+sh -c "$OVERSEER_FEEDER" overseer-feeder "$inbox" $$ $PPID > "$pipe" 2>/dev/null &
 exec "$@" app-server < "$pipe"
 `
 

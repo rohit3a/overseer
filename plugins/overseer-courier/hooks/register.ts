@@ -38,6 +38,10 @@ let dir = ''
 let hasState = true
 // receipt-file writes, in order; session.end waits them out
 let writes: Promise<void> = Promise.resolve()
+// reads the outbox and sends what is due; set at session.start
+let pump: () => void = () => {}
+// bumped at each session end: a read begun before a /clear sends nothing after it
+let generation = 0
 
 // past KEPT ids, the oldest go, but never one still waiting in the outbox: it would be sent again
 const remember = (ids: string[], waiting: Set<string>) => {
@@ -101,7 +105,7 @@ export const register: Register = on => {
       else void saveReceipts()
     }
     beat()
-    $.clock.every(2000, beat)
+    $.clock.every(5000, beat)
 
     const queued = async (): Promise<Item[]> => (hasState ? ((await $.state.get(outbox)).value ?? []) : readJson<Item[]>('outbox.json', []))
 
@@ -126,13 +130,21 @@ export const register: Register = on => {
       }
     }
 
+    // one read at a time; a call during one runs again once it ends, so no write is missed
     let isReading = false
-    $.clock.every(250, () => {
-      if (isReading) return
+    let isAgain = false
+    pump = () => {
+      if (isReading) {
+        isAgain = true
+        return
+      }
       isReading = true
+      isAgain = false
+      const at = generation
       void (async () => {
         try {
           const box = await queued()
+          if (at !== generation) return
           const due = box.filter(item => !inFlight.has(item.id))
           if (due.length === 0) return
           const ids = due.map(item => item.id)
@@ -144,22 +156,37 @@ export const register: Register = on => {
             forget(ids)
             return
           }
+          if (at !== generation) return
           // each send runs on its own: one slow wake-up never holds the others back
           for (const item of due) void deliver(item)
         } catch {
           // the next tick reads again
         } finally {
           isReading = false
+          if (isAgain) pump()
         }
       })()
-    })
+    }
+    // with $.state, each outbox write wakes the courier at once (the state.set hook
+    // below), and the timer only catches up after a reload; the file outbox is polled
+    $.clock.every(hasState ? 2000 : 250, () => pump())
+    // anything queued before this load goes now
+    pump()
     return started
   })
+
+  // Overseer queued a message: send it now instead of at the next tick
+  on('state.set', { plugin: 'overseer', key: 'outbox' }, async ($, e, next) => {
+    const res = await next(e)
+    if ('value' in res && res.value?.isSet === true) pump()
+    return res
+  }).catch(($, e, next) => next(e))
 
   // a /clear goes on in this process under a new session id, with no session.start
   on('session.end', async ($, e, next) => {
     // no heartbeat may write the folder back once it is gone: stop writing, let the
     // last writes land, then remove it (Overseer removes it too; whichever runs last finds it gone)
+    generation++
     const old = dir
     dir = ''
     await writes

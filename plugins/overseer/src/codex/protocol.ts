@@ -6,8 +6,28 @@ export type Rpc = { jsonrpc: '2.0'; id?: number; method: string; params?: unknow
 
 const req = (id: number, method: string, params: unknown): Rpc => ({ jsonrpc: '2.0', id, method, params })
 
+// high-volume notifications Overseer never reads: Codex doesn't send them at all
+export const QUIET_METHODS = [
+  'item/commandExecution/outputDelta',
+  'item/fileChange/outputDelta',
+  'item/fileChange/patchUpdated',
+  'command/exec/outputDelta',
+  'process/outputDelta',
+  'item/reasoning/textDelta',
+  'item/plan/delta',
+  'turn/diff/updated',
+  'remoteControl/status/changed',
+  'account/updated',
+]
+
+export const VERSION = '0.3.0'
+
 export const initialize = (id: number): Rpc =>
-  req(id, 'initialize', { clientInfo: { name: 'overseer', title: 'Overseer', version: '0.1.0' } })
+  req(id, 'initialize', {
+    clientInfo: { name: 'overseer', title: 'Overseer', version: VERSION },
+    // experimentalApi: turn/settings/update changes a running turn's model and effort in place
+    capabilities: { experimentalApi: true, requestAttestation: false, optOutNotificationMethods: QUIET_METHODS },
+  })
 
 export const initialized = (): Rpc => ({ jsonrpc: '2.0', method: 'initialized' })
 
@@ -21,19 +41,23 @@ export const threadResume = (id: number, o: { threadId: string; cwd: string; san
     sandbox: o.sandbox,
     approvalPolicy: 'never',
     model: o.model ?? null,
+    // the pane keeps its own history: don't send the whole thread back
+    excludeTurns: true,
   })
 
 const textInput = (text: string) => [{ type: 'text', text, text_elements: [] }]
 
-// isFast: true asks for Codex's fast tier, false for standard speed, this turn only;
-// undefined keeps the thread's tier (the user's Codex config)
-export const turnStart = (id: number, o: { threadId: string; text: string; model?: string; effort?: string; isFast?: boolean }): Rpc =>
+// isFast: true asks for the model's fast tier (its id from model/list, `priority` today),
+// false for standard speed, this turn only; undefined keeps the thread's tier (the user's Codex config)
+export const turnStart = (id: number, o: { threadId: string; text: string; model?: string; effort?: string; isFast?: boolean; fastTier?: string }): Rpc =>
   req(id, 'turn/start', {
     threadId: o.threadId,
     input: textInput(o.text),
     model: o.model ?? null,
     effort: o.effort ?? null,
-    serviceTierForTurn: o.isFast === undefined ? null : o.isFast ? 'fast' : 'default',
+    serviceTierForTurn: o.isFast === undefined ? null : o.isFast ? (o.fastTier ?? 'priority') : 'default',
+    // a short summary of its reasoning streams as it thinks: the pane shows it live
+    summary: 'concise',
   })
 
 export const turnSteer = (id: number, o: { threadId: string; turnId: string; text: string }): Rpc =>
@@ -42,22 +66,55 @@ export const turnSteer = (id: number, o: { threadId: string; turnId: string; tex
 export const turnInterrupt = (id: number, o: { threadId: string; turnId: string }): Rpc =>
   req(id, 'turn/interrupt', { threadId: o.threadId, turnId: o.turnId })
 
+// changes the running turn's model and effort without stopping it; `applied` or `targetUnavailable`
+export const turnSettingsUpdate = (id: number, o: { threadId: string; turnId: string; model?: string; effort?: string }): Rpc =>
+  req(id, 'turn/settings/update', { threadId: o.threadId, turnId: o.turnId, model: o.model ?? null, effort: o.effort ?? null })
+
+export const isApplied = (result: unknown) => str(obj(result).status) === 'applied'
+
+// the thread stops streaming here; once no client holds it, the app-server unloads it
+export const threadUnsubscribe = (id: number, o: { threadId: string }): Rpc => req(id, 'thread/unsubscribe', { threadId: o.threadId })
+
 export const modelList = (id: number): Rpc => req(id, 'model/list', {})
 
 // what one line from app-server means for the agent's record
-export type CodexEvent =
+// threadId: the thread a notification is about, when it names one (a Codex sub-agent's differ)
+export type CodexEvent = { threadId?: string } & (
   | { kind: 'response'; id: number; result?: unknown; error?: string }
   | { kind: 'serverRequest'; id: number | string; method: string }
   | { kind: 'turnStarted'; turnId: string }
   | { kind: 'turnCompleted'; turnId: string; status: string; error?: string }
-  | { kind: 'delta'; text: string }
+  | { kind: 'delta'; text: string; itemId: string }
+  | { kind: 'thinking'; text: string; itemId: string }
   | { kind: 'activity'; text: string }
-  | { kind: 'message'; text: string }
+  | { kind: 'message'; text: string; isFinal: boolean }
   | { kind: 'tool'; text: string }
   | { kind: 'usage'; input: number; output: number }
   | { kind: 'model'; model: string }
   | { kind: 'error'; text: string; willRetry: boolean }
   | { kind: 'ignore' }
+)
+
+// the answer a server request gets: a typed decline where Codex defines one, else an error
+export const declineFor = (method: string): { result: unknown } | undefined => {
+  switch (method) {
+    case 'item/commandExecution/requestApproval':
+    case 'item/fileChange/requestApproval':
+      return { result: { decision: 'decline' } }
+    // the v1 approvals, still in the schema
+    case 'execCommandApproval':
+    case 'applyPatchApproval':
+      return { result: { decision: { denied: { rejection: 'Overseer runs Codex without approvals.' } } } }
+    case 'mcpServer/elicitation/request':
+      return { result: { action: 'decline', content: null, _meta: null } }
+    case 'item/tool/requestUserInput':
+      return { result: { answers: {} } }
+    case 'item/permissions/requestApproval':
+      return { result: { permissions: {}, scope: 'turn' } }
+    default:
+      return undefined
+  }
+}
 
 type Obj = Record<string, unknown>
 const obj = (v: unknown): Obj => (v !== null && typeof v === 'object' ? (v as Obj) : {})
@@ -72,7 +129,7 @@ const oneLine = (s: string, max = 140) => {
 // `/bin/zsh -lc 'echo A'` → `echo A`
 export const unwrapShell = (command: string) => {
   const m = /^\S*(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/.exec(command.trim())
-  return m === null ? command : m[2]
+  return m?.[2] ?? command
 }
 
 // a finished item that did not succeed
@@ -105,9 +162,14 @@ const baseLine = (item: Obj, isDone: boolean): { kind: 'tool' | 'activity'; text
       return isDone ? { kind: 'tool', text } : { kind: 'activity', text }
     }
     case 'webSearch': {
-      const text = `Search: ${oneLine(str(item.query))}`
-      return isDone ? { kind: 'tool', text } : { kind: 'activity', text }
+      const action = obj(item.action)
+      const queries = Array.isArray(action.queries) ? action.queries.map(str).filter(q => q !== '') : []
+      const what = str(item.query) || str(action.query) || queries.join(' · ') || str(action.url)
+      const text = what === '' ? 'Searching the web…' : `Search: ${oneLine(what)}`
+      return isDone ? (what === '' ? undefined : { kind: 'tool', text }) : { kind: 'activity', text }
     }
+    case 'contextCompaction':
+      return isDone ? { kind: 'tool', text: 'Compacted its context' } : { kind: 'activity', text: 'Compacting its context…' }
     case 'reasoning':
       return isDone ? undefined : { kind: 'activity', text: 'Thinking…' }
     case 'plan':
@@ -128,13 +190,22 @@ export const parseLine = (line: string): CodexEvent => {
     return { kind: 'ignore' }
   }
   // a request from the server (an approval, an elicitation): it waits for an answer
-  if ((typeof m.id === 'number' || typeof m.id === 'string') && typeof m.method === 'string') return { kind: 'serverRequest', id: m.id, method: m.method }
+  if ((typeof m.id === 'number' || typeof m.id === 'string') && typeof m.method === 'string') {
+    const threadId = str(obj(m.params).threadId) || undefined
+    return { kind: 'serverRequest', id: m.id, method: m.method, ...(threadId === undefined ? {} : { threadId }) }
+  }
   if (typeof m.id === 'number' && m.method === undefined) {
     const err = obj(m.error)
     return { kind: 'response', id: m.id, result: m.result, error: m.error === undefined ? undefined : str(err.message) || 'error' }
   }
   const p = obj(m.params)
-  switch (m.method) {
+  const threadId = str(p.threadId) || undefined
+  const ev = parseNotification(str(m.method), p)
+  return threadId === undefined || ev.kind === 'ignore' ? ev : { ...ev, threadId }
+}
+
+const parseNotification = (method: string, p: Obj): CodexEvent => {
+  switch (method) {
     case 'turn/started':
       return { kind: 'turnStarted', turnId: str(obj(p.turn).id) }
     case 'turn/completed': {
@@ -143,14 +214,23 @@ export const parseLine = (line: string): CodexEvent => {
       return { kind: 'turnCompleted', turnId: str(turn.id), status: str(turn.status), error: str(err.message) || undefined }
     }
     case 'item/agentMessage/delta':
-      return { kind: 'delta', text: str(p.delta) }
+      return { kind: 'delta', text: str(p.delta), itemId: str(p.itemId) }
+    case 'item/reasoning/summaryTextDelta':
+      // each summary part of a reasoning item streams on its own
+      return { kind: 'thinking', text: str(p.delta), itemId: `${str(p.itemId)}:${typeof p.summaryIndex === 'number' ? p.summaryIndex : 0}` }
+    case 'turn/plan/updated': {
+      const plan = Array.isArray(p.plan) ? p.plan.map(s => obj(s)) : []
+      const done = plan.filter(s => s.status === 'completed').length
+      const now = plan.find(s => s.status === 'inProgress') ?? plan.find(s => s.status === 'pending')
+      return plan.length === 0 ? { kind: 'ignore' } : { kind: 'activity', text: `Plan ${done}/${plan.length}${now !== undefined ? `: ${oneLine(str(now.step), 100)}` : ''}` }
+    }
     case 'item/started': {
       const line = itemLine(obj(p.item), false)
       return line === undefined ? { kind: 'ignore' } : line
     }
     case 'item/completed': {
       const item = obj(p.item)
-      if (str(item.type) === 'agentMessage') return { kind: 'message', text: str(item.text) }
+      if (str(item.type) === 'agentMessage') return { kind: 'message', text: str(item.text), isFinal: item.phase === 'final_answer' }
       const line = itemLine(item, true)
       return line === undefined ? { kind: 'ignore' } : line
     }
@@ -178,6 +258,8 @@ export const parseModels = (result: unknown): CodexModel[] => {
     .map(m => ({
       id: str(m.id),
       label: str(m.displayName) || str(m.id),
+      // the tier Codex calls Fast for this model, if it has one
+      fastTier: (Array.isArray(m.serviceTiers) ? m.serviceTiers.map(t => obj(t)) : []).map(t => str(t.id)).find(id => id !== '' && id !== 'default'),
       efforts: Array.isArray(m.supportedReasoningEfforts)
         ? m.supportedReasoningEfforts.map(e => str(obj(e).reasoningEffort)).filter(e => e !== '')
         : [],

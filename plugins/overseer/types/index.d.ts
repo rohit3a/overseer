@@ -104,6 +104,8 @@ export type CodexModel = {
   label: string
   efforts: string[]
   isDefault: boolean
+  // the id of the model's fast service tier, where it has one
+  fastTier?: string
 }
 
 export type UiState = {
@@ -120,6 +122,8 @@ export type UiState = {
 
 export type Settings = {
   isEnabled: boolean
+  // the person closed the Agents pane this session: new agents don't open it again
+  isPaneDismissed?: boolean
 }
 
 declare module 'claude-code' {
@@ -136,6 +140,13 @@ declare module 'claude-code' {
       drafts: Record<string, string>
       // the courier's heartbeat stopped (or never started): messaging can't work
       isCourierMissing: boolean
+      // streaming activity by agent, for panes that can't ask for their own line (VS Code, mobile)
+      streaming: Record<string, string>
+    }
+    // owned by overseer-courier; repeated here (same shape) so Overseer type-checks without it
+    'overseer-courier': {
+      sent: string[]
+      heartbeat: number
     }
   }
 }

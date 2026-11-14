@@ -91,6 +91,7 @@ if name == 'codex':
     check('F6b follow-up after finishing continued the thread', any('PING2' in t for t in answers), answers[-1:])
     check('Claude got the Codex reply', 'STEERED' in out, out.strip()[-200:])
     user = [m for m in a['thread'] if m['by'] == 'user']
+    check('both Codex agents ran on one process', len(evs('codexConnStart')) == 1, f"{len(evs('codexConnStart'))} processes")
     check('both messages recorded and read', len(user) == 2 and all(m.get('state') == 'read' for m in user), [(m['text'][:15], m.get('state')) for m in user])
 
 if name == 'recover':
@@ -125,11 +126,22 @@ if name == 'stop':
 if name == 'codexapply':
     a = [x for x in agents if x['kind'] == 'codex'][0]
     texts = [m['text'] for m in a['thread']]
-    check('turn interrupted to apply settings', any('apply the new settings' in t for t in texts), texts[-5:])
-    starts = evs('codexTurnStart', id=a['id'])
-    check('a new turn started with effort high', any(t.get('effort') == 'high' for t in starts[1:]), starts)
+    check('settings applied to the running turn in place', bool(evs('codexApplied', id=a['id'], effort='high')) and any('Applied the new settings' in t for t in texts), texts[-5:])
+    check('the turn was not interrupted', not any('apply the new settings' in t for t in texts) and len(evs('codexTurnStart', id=a['id'])) == 1, evs('codexTurnStart', id=a['id']))
     check('new effort in force', a.get('effort') == 'high', a.get('effort'))
     check('codex finished after apply', a['status'] == 'completed', a.get('error'))
     check('Claude got a reply', 'FINISHED' in out, out.strip()[-200:])
+
+if name == 'codexidle':
+    a = [x for x in agents if x['kind'] == 'codex' and x['name'] == 'idle-a']
+    check('codex agent recorded', len(a) == 1, f'{len(a)} agents')
+    if not a:
+        sys.exit(1)
+    a = a[0]
+    check('the idle process quit', bool(evs('codexIdleQuit')))
+    check('a new process started for the follow-up', len(evs('codexConnStart')) == 2, f"{len(evs('codexConnStart'))} processes")
+    answers = [m['text'] for m in a['thread'] if m['by'] == 'agent']
+    check('the follow-up resumed the same thread', any('ONE' in t for t in answers) and any('TWO' in t for t in answers) and len(evs('codexTurnCompleted', id=a['id'])) == 2, answers)
+    check('Claude got both replies', 'TWO' in out, out.strip()[-200:])
 
 sys.exit(0 if ok else 1)

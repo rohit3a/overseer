@@ -30,6 +30,8 @@ export type PaneActions = {
   stop: (id: string) => void
   endCodex: (id: string) => void
   copyId: (id: string) => void
+  // puts a Claude subagent's transcript in the main view
+  showInChat: (id: string) => void
   review: (id: string, decision: 'approve' | 'deny') => void
   editReview: (id: string) => void
   submitReview: (id: string, text: string) => void
@@ -42,6 +44,10 @@ export type PaneData = {
   isCourierMissing?: boolean
   // a self-ticking elapsed label where the surface runs client modules
   clock?: (key: string, from: number, to?: number, color?: string) => unknown
+  // a self-updating activity line where the surface runs client modules
+  live?: (id: string, text: string, color: string, room: number) => unknown
+  // each agent's latest activity, fresher than the record between writes
+  activity?: Record<string, string>
   agents: Agents
   ui: UiState
   reviews: Review[]
@@ -53,6 +59,8 @@ export type PaneData = {
   surface: string
   // the build draws a Button from its label alone (2.1.280), not from styled children
   isPlainButtons?: boolean
+  // the surface can switch its main view to a subagent's transcript ($.ui.view)
+  canView?: boolean
 }
 
 const AUTO = '__auto__'
@@ -242,9 +250,13 @@ const card = (el: Els, d: PaneData, act: PaneActions, rec: AgentRecord, depth: n
     { key: 'status', text: kind, parts: [<Text dimColor>{truncate(kind, room)}</Text>] },
   ]
   if (usage !== '' && !isOpen) lines.push({ key: 'usage', text: usage, parts: [<Text dimColor>{truncate(usage, room)}</Text>] })
-  if (isLive && rec.activity !== '') {
-    const activity = `▸ ${rec.activity.replace(/^▸\s*/, '')}`
-    lines.push({ key: 'activity', text: activity, parts: [<Text color={rec.isPaused || rec.isStopping ? 'warning' : 'suggestion'}>{truncate(activity, room)}</Text>] })
+  const now = d.activity?.[rec.id] ?? rec.activity
+  const activityColor = rec.isPaused || rec.isStopping ? 'warning' : 'suggestion'
+  // drawn by the surface where it can be, so streaming never redraws the pane
+  const liveLine = isLive && d.live !== undefined ? d.live(rec.id, now === '' ? '' : `▸ ${now.replace(/^▸\s*/, '')}`, activityColor, room) : undefined
+  if (isLive && now !== '' && liveLine === undefined) {
+    const activity = `▸ ${now.replace(/^▸\s*/, '')}`
+    lines.push({ key: 'activity', text: activity, parts: [<Text color={activityColor}>{truncate(activity, room)}</Text>] })
   }
   if (!isLive && rec.error !== undefined) lines.push({ key: 'error', text: rec.error, parts: [<Text color="error">{truncate(rec.error, room)}</Text>] })
 
@@ -283,6 +295,7 @@ const card = (el: Els, d: PaneData, act: PaneActions, rec: AgentRecord, depth: n
       <Box flexDirection="row" justifyContent="space-between" alignItems="flex-start">
         <Box flexDirection="column" flexShrink={1} flexGrow={1} overflow="hidden">
           {summary}
+          {liveLine}
         </Box>
         <Box flexDirection="column" alignItems="flex-end" flexShrink={0}>
           {isOpen ? (
@@ -406,6 +419,7 @@ const body = (el: Els, d: PaneData, act: PaneActions, rec: AgentRecord, width: n
         {rec.kind === 'claude' && rec.isPaused === true && <Button key={`resume-${rec.id}`} variant="primary" onPress={() => act.resume(rec.id)}>Resume</Button>}
         {isCodexTurn && (pendingModel || pendingEffort) && <Button key={`apply-${rec.id}`} variant="primary" onPress={() => act.applyNow(rec.id)}>Apply now</Button>}
         {rec.kind === 'codex' && rec.codex?.isAlive === true && <Button key={`end-${rec.id}`} dimColor onPress={() => act.endCodex(rec.id)}>Quit Codex</Button>}
+        {rec.kind === 'claude' && d.canView === true && <Button key={`view-${rec.id}`} onPress={() => act.showInChat(rec.id)}>Show in chat</Button>}
         <Button key={`copy-${rec.id}`} dimColor onPress={() => act.copyId(rec.id)}>Copy ID</Button>
       </Box>
 
