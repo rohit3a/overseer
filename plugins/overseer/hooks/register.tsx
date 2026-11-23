@@ -26,6 +26,8 @@ import { renderPane, type PaneActions } from '../src/ui/pane'
 
 const PANE = 'overseer'
 const CODEX_TOOL = 'mcp__overseer__codex'
+// steering for other plugins; deferred behind ToolSearch, and refused when the model calls it
+const CONTROL_TOOL = 'mcp__overseer__control'
 const COURIER = 'overseer-courier'
 
 // ── state: the host's $.state, or module variables on a build without it ──
@@ -391,7 +393,14 @@ type Controller = {
   openPane: () => Promise<void>
   debug: (ev: Record<string, unknown>) => void
   debugAt: (at: 'step' | 'complete' | 'tool', id: string, index: number) => Promise<void>
+  control: (input: ControlInput) => Promise<ControlResult>
 }
+
+// mcp__overseer__control, for other plugins: steer one agent as the pane would
+type ControlInput = { agent?: unknown; op?: unknown; value?: unknown }
+type ControlResult =
+  | { ok: true; via: string; note: string; override?: AgentRecord['override'] | null }
+  | { ok: false; reason: string; code?: 'courier-missing' }
 
 // OVERSEER_DEBUG_SCRIPT drives pane actions from a headless run (conformance tests)
 type DebugRule = { kind?: 'claude' | 'codex'; at: 'step' | 'complete' | 'tool'; index?: number; op: 'model' | 'effort' | 'send' | 'pause' | 'clear' | 'applyNow' | 'stopTurn' | 'stop'; value?: string; delayMs?: number; ms?: number }
@@ -1524,8 +1533,144 @@ export const register: Register = (on, options) => {
     const requestStop = async (id: string) => {
       const rec = cache[id]
       if (rec === undefined) return
-      if (rec.kind === 'codex') return actions.stopTurn(id)
+      if (rec.kind === 'codex') {
+        const failed = await stopTurn(id)
+        if (failed !== undefined) toast(`Codex: ${failed}`)
+        return
+      }
       await mut(a => patch(a, id, r => ({ ...r, isStopping: true, isPaused: false, activity: 'Stopping after the current step…' })))
+    }
+
+    const setModel = async (id: string, value: string) => {
+      const picked = value === '__auto__' ? undefined : resolveModel(value)
+      const model = picked === cache[id]?.model ? undefined : picked
+      await mut(a => patch(a, id, r => ({ ...r, override: { ...r.override, model } })))
+      overrideFailed.delete(id)
+      const rec = cache[id]
+      if (model !== undefined && rec?.kind === 'claude') void validateClaudeModel(id, model)
+    }
+    const setEffort = (id: string, value: string) =>
+      mut(a => patch(a, id, r => ({ ...r, override: { ...r.override, effort: value === '__auto__' || value === r.effort ? undefined : value } })))
+    const setPaused = (id: string, isPaused: boolean) =>
+      mut(a => patch(a, id, r => (isPaused ? { ...r, isPaused: true, activity: 'Pausing before its next request…' } : { ...r, isPaused: false, status: r.status === 'paused' ? 'running' : r.status, activity: 'Resuming…' })))
+
+    // a running Codex turn takes the pending override: in place when Codex accepts it, else the turn stops and
+    // a new one continues with it (Codex refuses some model switches mid-turn)
+    const applyNow = async (id: string): Promise<{ kind: 'applied' | 'continued' | 'none' } | { kind: 'failed'; reason: string }> => {
+      const rec = cache[id]
+      const p = procs.get(id)
+      if (rec?.kind !== 'codex' || p === undefined || rec.codex?.turnId === undefined || rec.codex.threadId === undefined) return { kind: 'none' }
+      const threadId = rec.codex.threadId
+      const turnId = rec.codex.turnId
+      const want = { model: rec.override?.model, effort: rec.override?.effort }
+      if (want.model === undefined && want.effort === undefined) return { kind: 'none' }
+      // in place first: the turn goes on with the new settings, nothing it did is lost
+      const applied = await call(p.conn, cid => rpc.turnSettingsUpdate(cid, { threadId, turnId, ...want }), 15_000)
+        .then(rpc.isApplied)
+        .catch(() => false)
+      if (applied) {
+        // that turn alone: the next turn carries them on
+        const before = carried.get(id)
+        carried.set(id, { model: want.model ?? before?.model, effort: want.effort ?? before?.effort })
+        debug({ ev: 'codexApplied', id, ...want })
+        // a choice made while this was out stays pending
+        await mut(a =>
+          patch(a, id, r => {
+            const left = { model: r.override?.model === want.model ? undefined : r.override?.model, effort: r.override?.effort === want.effort ? undefined : r.override?.effort }
+            return withMsg(
+              { ...r, model: want.model ?? r.model, effort: want.effort ?? r.effort, override: left.model === undefined && left.effort === undefined ? undefined : left },
+              'system',
+              'Applied the new settings to the running turn.',
+            )
+          }),
+        )
+        return { kind: 'applied' }
+      }
+      // a build without it, or a turn it can't reach: stop the turn and continue in a new one
+      // whoever waits on this turn (a foreground tool call) waits on the continued one instead
+      const waiters = p.waiters.splice(0)
+      const answer = (text: string) => waiters.forEach(w => w(text))
+      try {
+        p.chainFrom = rec.codex.turnId
+        await call(p.conn, cid => rpc.turnInterrupt(cid, { threadId, turnId }))
+      } catch (err) {
+        p.chainFrom = undefined
+        p.waiters.push(...waiters)
+        return { kind: 'failed', reason: err instanceof Error ? err.message : String(err) }
+      }
+      startTurn(id, 'Continue the task where you left off.')
+        .then(answer)
+        .catch(err => answer(`(Codex could not continue: ${err instanceof Error ? err.message : String(err)})`))
+      return { kind: 'continued' }
+    }
+
+    // undefined once the turn is stopped, else why not
+    const stopTurn = async (id: string): Promise<string | undefined> => {
+      const rec = cache[id]
+      const p = procs.get(id)
+      if (p === undefined || rec?.codex?.turnId === undefined || rec.codex.threadId === undefined) return 'it is not working now, so there is no turn to stop'
+      const turn = { threadId: rec.codex.threadId, turnId: rec.codex.turnId }
+      return call(p.conn, cid => rpc.turnInterrupt(cid, turn)).then(
+        () => undefined,
+        err => (err instanceof Error ? err.message : String(err)),
+      )
+    }
+
+    // Another plugin's steering (mcp__overseer__control): the pane's own actions, awaited, answered with what
+    // happened, so the agent's record and the pane show it as if it was done here
+    const control = async (input: ControlInput): Promise<ControlResult> => {
+      const rec = findAgent(cache, String(input.agent ?? ''))
+      if (rec === undefined) return { ok: false, reason: 'Overseer has no agent with that id or name in this session.' }
+      const id = rec.id
+      const value = typeof input.value === 'string' ? input.value.trim() : ''
+      const working = isActive(rec.status)
+      const codexTurn = rec.kind === 'codex' && rec.codex?.turnId !== undefined && procs.has(id)
+      switch (input.op) {
+        case 'send': {
+          if (value === '') return { ok: false, reason: 'A message needs text.' }
+          if (rec.kind === 'claude' && wasCourierMissing) return { ok: false, reason: `Messages to Claude subagents need the ${COURIER} plugin, which is not running.`, code: 'courier-missing' }
+          // a finished Codex agent's send lasts its whole new turn: start it, and answer now
+          if (rec.kind === 'codex' && !codexTurn) {
+            void send(id, value).catch(() => undefined)
+            return { ok: true, via: 'overseer', note: 'Codex continues the same thread with it; the parent hears its reply.' }
+          }
+          await send(id, value)
+          if (rec.kind === 'codex') return { ok: true, via: 'overseer', note: 'It joins the running Codex turn.' }
+          return { ok: true, via: COURIER, note: working ? 'It reads it at its next step.' : 'It wakes under the same id, with its history.' }
+        }
+        case 'model':
+        case 'effort': {
+          if (value === '') return { ok: false, reason: `Name a ${input.op}, or default.` }
+          const v = value === 'default' ? '__auto__' : value
+          if (input.op === 'model') await setModel(id, v)
+          else await setEffort(id, v)
+          const ov = cache[id]?.override
+          const label = `${ov?.model ?? 'its own model'}, ${ov?.effort ?? 'its own effort'}`
+          if (rec.kind === 'claude') return { ok: true, via: 'override', note: `${label} from its next request.`, override: ov ?? null }
+          if (!codexTurn) return { ok: true, via: 'override', note: `${label} from its next turn.`, override: ov ?? null }
+          const r = await applyNow(id)
+          if (r.kind === 'applied') return { ok: true, via: 'turn/settings/update', note: 'Applied to the running turn in place.' }
+          if (r.kind === 'continued') return { ok: true, via: 'turn/interrupt', note: 'Codex would not switch in place, so the turn stopped and a new one continues with it.' }
+          if (r.kind === 'failed') return { ok: false, reason: `Codex: ${r.reason}` }
+          return { ok: true, via: 'override', note: `${label} from its next turn.`, override: ov ?? null }
+        }
+        case 'pause':
+        case 'resume':
+          if (rec.kind === 'codex') return { ok: false, reason: 'Overseer pauses Claude subagents only. Stop the Codex turn instead, and message it to go on.' }
+          await setPaused(id, input.op === 'pause')
+          return { ok: true, via: 'overseer', note: input.op === 'resume' ? 'It goes on.' : working ? 'It holds before its next request until resumed.' : 'It is not working now; it holds before its next request if it is woken.' }
+        case 'stop': {
+          if (rec.kind === 'claude') {
+            if (!working) return { ok: false, reason: 'It is not working now.' }
+            await requestStop(id)
+            return { ok: true, via: 'overseer', note: 'It ends at its next request.' }
+          }
+          const failed = await stopTurn(id)
+          return failed === undefined ? { ok: true, via: 'turn/interrupt', note: 'Its turn stops; a message continues the thread.' } : { ok: false, reason: `Codex: ${failed}` }
+        }
+        default:
+          return { ok: false, reason: 'op is send, model, effort, pause, resume or stop.' }
+      }
     }
 
     const actions: PaneActions = {
@@ -1556,17 +1701,8 @@ export const register: Register = (on, options) => {
           for (const id of [...savedHistory]) if (cache[id] === undefined) savedHistory.delete(id)
           await setUi(u => (u.selected !== undefined && cache[u.selected] === undefined ? { ...u, selected: undefined } : u))
         })(),
-      setModel: (id, value) =>
-        void (async () => {
-          const picked = value === '__auto__' ? undefined : resolveModel(value)
-          const model = picked === cache[id]?.model ? undefined : picked
-          await mut(a => patch(a, id, r => ({ ...r, override: { ...r.override, model } })))
-          overrideFailed.delete(id)
-          const rec = cache[id]
-          if (model !== undefined && rec?.kind === 'claude') void validateClaudeModel(id, model)
-        })(),
-      setEffort: (id, value) =>
-        void mut(a => patch(a, id, r => ({ ...r, override: { ...r.override, effort: value === '__auto__' || value === r.effort ? undefined : value } }))),
+      setModel: (id, value) => void setModel(id, value),
+      setEffort: (id, value) => void setEffort(id, value),
       send: (id, text) => void send(id, text),
       draft: (id, text) => draft(id, text),
       broadcast: text =>
@@ -1576,64 +1712,16 @@ export const register: Register = (on, options) => {
           toast(targets.length === 0 ? 'No agent is running.' : `Sent to ${targets.length} agent${targets.length === 1 ? '' : 's'}.`)
           await setUi(u => ({ ...u, isBroadcastOpen: false }))
         })(),
-      pause: id => void mut(a => patch(a, id, r => ({ ...r, isPaused: true, activity: 'Pausing before its next request…' }))),
-      resume: id => void mut(a => patch(a, id, r => ({ ...r, isPaused: false, status: r.status === 'paused' ? 'running' : r.status, activity: 'Resuming…' }))),
+      pause: id => void setPaused(id, true),
+      resume: id => void setPaused(id, false),
       applyNow: id =>
-        void (async () => {
-          const rec = cache[id]
-          const p = procs.get(id)
-          if (rec?.kind !== 'codex' || p === undefined || rec.codex?.turnId === undefined || rec.codex.threadId === undefined) return
-          const threadId = rec.codex.threadId
-          const turnId = rec.codex.turnId
-          const want = { model: rec.override?.model, effort: rec.override?.effort }
-          // in place first: the turn goes on with the new settings, nothing it did is lost
-          const applied = (want.model !== undefined || want.effort !== undefined) && await call(p.conn, cid => rpc.turnSettingsUpdate(cid, { threadId, turnId, ...want }), 15_000)
-            .then(rpc.isApplied)
-            .catch(() => false)
-          if (applied) {
-            // that turn alone: the next turn carries them on
-            const before = carried.get(id)
-            carried.set(id, { model: want.model ?? before?.model, effort: want.effort ?? before?.effort })
-            debug({ ev: 'codexApplied', id, ...want })
-            // a choice made while this was out stays pending
-            await mut(a =>
-              patch(a, id, r => {
-                const left = { model: r.override?.model === want.model ? undefined : r.override?.model, effort: r.override?.effort === want.effort ? undefined : r.override?.effort }
-                return withMsg(
-                  { ...r, model: want.model ?? r.model, effort: want.effort ?? r.effort, override: left.model === undefined && left.effort === undefined ? undefined : left },
-                  'system',
-                  'Applied the new settings to the running turn.',
-                )
-              }),
-            )
-            return
-          }
-          // a build without it, or a turn it can't reach: stop the turn and continue in a new one
-          // whoever waits on this turn (a foreground tool call) waits on the continued one instead
-          const waiters = p.waiters.splice(0)
-          const answer = (text: string) => waiters.forEach(w => w(text))
-          try {
-            p.chainFrom = rec.codex.turnId
-            await call(p.conn, cid => rpc.turnInterrupt(cid, { threadId: rec.codex!.threadId!, turnId: rec.codex!.turnId! }))
-          } catch (err) {
-            p.chainFrom = undefined
-            p.waiters.push(...waiters)
-            toast(`Codex: ${err instanceof Error ? err.message : String(err)}`)
-            return
-          }
-          startTurn(id, 'Continue the task where you left off.')
-            .then(answer)
-            .catch(err => answer(`(Codex could not continue: ${err instanceof Error ? err.message : String(err)})`))
-        })(),
+        void applyNow(id).then(r => {
+          if (r.kind === 'failed') toast(`Codex: ${r.reason}`)
+        }),
       stopTurn: id =>
-        void (async () => {
-          const rec = cache[id]
-          const p = procs.get(id)
-          if (p === undefined || rec?.codex?.turnId === undefined || rec.codex.threadId === undefined) return
-          await call(p.conn, cid => rpc.turnInterrupt(cid, { threadId: rec.codex!.threadId!, turnId: rec.codex!.turnId! })).catch(err =>
-            toast(`Codex: ${err instanceof Error ? err.message : String(err)}`),
-          )
-        })(),
+        void stopTurn(id).then(r => {
+          if (r !== undefined) toast(`Codex: ${r}`)
+        }),
       stop: id => void requestStop(id),
       endCodex: id => {
         release(id)
@@ -1699,7 +1787,7 @@ export const register: Register = (on, options) => {
       }
     }
 
-    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, planCodex, codexTool, saveHistory, endAll, fence, reset, actions, epoch: () => epoch, openPane, debug, debugAt }
+    ctl = { mut, setUi, spawned, ensure, live, send, sawCourierSend, sawModelSend, revive, planCodex, codexTool, saveHistory, endAll, fence, reset, actions, epoch: () => epoch, openPane, debug, debugAt, control }
 
     // ───────────────────────────── timers ─────────────────────────────
 
@@ -1832,6 +1920,17 @@ export const register: Register = (on, options) => {
           fast: { type: 'boolean', description: 'Run on Codex\'s fast tier (about 1.5-2x speed, uses more of the plan). Leave out for the user\'s setting; false for standard speed.' },
         },
         required: ['prompt'],
+      },
+    })
+    // registered (and so listed) because $.tool.call finds only listed tools; deferred, and a model call is refused
+    await $.tool.register({
+      name: 'control',
+      description: 'For other plugins only (a call from the model is refused): steer one Overseer agent with send, model, effort, pause, resume or stop.',
+      isDeferred: true,
+      inputSchema: {
+        type: 'object',
+        properties: { agent: { type: 'string' }, op: { type: 'string', enum: ['send', 'model', 'effort', 'pause', 'resume', 'stop'] }, value: { type: 'string' } },
+        required: ['agent', 'op'],
       },
     })
 
@@ -2051,6 +2150,18 @@ export const register: Register = (on, options) => {
     const text = await holdWhile($, ctl.codexTool(plan, e.agentId, next.signal), next.signal)
     return { result: text }
   }).catch(($, e, next) => ({ result: `Overseer's Codex tool failed: ${next.error?.message ?? 'unknown error'}` }))
+
+  // Other plugins steer an agent here with $.tool.call({ tool: 'mcp__overseer__control', agent, op, value }):
+  // op is send, model, effort, pause, resume or stop; the answer is JSON, { ok, via, note } or { ok: false, reason }.
+  // A call from the model is refused.
+  on('tool.call', { tool: CONTROL_TOOL }, async ($, e, next) => {
+    if (next.origin?.plugin === 'engine') return { deny: `${CONTROL_TOOL} is for other plugins, not the model.` }
+    const answer = (r: ControlResult) => ({ result: JSON.stringify(r) })
+    if (ctl === undefined) return answer({ ok: false, reason: 'Overseer is still starting; try again in a moment.' })
+    if (!isEnabled) return answer({ ok: false, reason: 'Overseer is off for this session; /overseer on turns it back on.' })
+    const raw = e as unknown as ControlInput
+    return answer(await ctl.control({ agent: raw.agent, op: raw.op, value: raw.value }))
+  }).catch(($, e, next) => ({ result: JSON.stringify({ ok: false, reason: `Overseer's control failed: ${next.error?.message ?? 'unknown error'}` }) }))
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (isEnabled && opt.redirectCodexBash && !isWindows && rpc.isRawCodexExec(String(e.command ?? ''))) {
