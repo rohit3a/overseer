@@ -154,6 +154,22 @@ describe('pane', () => {
   })
 })
 
+// another plugin, as Clawd is: it steers through Overseer's control tool when its command runs
+const steerer = {
+  name: 'steerer',
+  register: (on: On) => {
+    on('command.run', { command: 'steer' }, async ($, e) => {
+      const r = (await $.tool.call({ tool: 'mcp__overseer__control', ...JSON.parse(e.args) } as never)) as { result?: string; deny?: string }
+      return { text: r.result ?? JSON.stringify({ ok: false, reason: r.deny }) }
+    })
+  },
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const steer = async ($: any, input: object): Promise<{ ok: boolean } & Record<string, unknown>> => {
+  const r = await $.command.run({ command: 'steer', args: JSON.stringify(input), origin: { kind: 'sdk' }, presentation: { isFullscreen: false, columns: 80 } })
+  return JSON.parse((r as { text: string }).text)
+}
+
 describe('control', () => {
   test('picking a model and effort overrides the next request', async ($, on) => {
     const { seen } = world(on)
@@ -241,6 +257,46 @@ describe('control', () => {
     await tick(2)
     await pending
     expect(seen.steps).toHaveLength(2)
+  })
+
+  test('another plugin steers an agent through mcp__overseer__control, as the pane would', { plugins: [steerer] }, async ($, on) => {
+    const { seen, tick } = world(on)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    await drain($.turn.step(step(0)))
+
+    const model = await steer($, { agent: 'a1', op: 'model', value: 'claude-sonnet-5-5' })
+    expect(model).toMatchObject({ ok: true, via: 'override', override: { model: 'claude-sonnet-5-5' } })
+    expect((await steer($, { agent: 'probe worker', op: 'effort', value: 'low' })).ok).toBe(true)
+    // the pane shows what the other plugin set
+    const ui = await $.ui.mount({ plugin: 'overseer', surface: 'desktop', component: 'Pane', requestId: 'overseer', props: paneProps() })
+    await ui.press({ key: 'row-a1' })
+    expect(await ui.find({ text: /→ Sonnet 5\.5 · low from the next request/ })).toBeDefined()
+    await drain($.turn.step(step(1)))
+    expect(seen.steps.at(-1)).toEqual({ model: 'claude-sonnet-5-5', effort: 'low', agentId: 'a1' })
+
+    expect((await steer($, { agent: 'a1', op: 'pause' })).ok).toBe(true)
+    let isDone = false
+    const pending = drain($.turn.step(step(2))).then(() => (isDone = true))
+    await tick(3)
+    expect(isDone).toBe(false)
+    expect((await steer($, { agent: 'a1', op: 'resume' })).ok).toBe(true)
+    await tick(2)
+    await pending
+
+    expect(await steer($, { agent: 'a1', op: 'model', value: 'default' })).toMatchObject({ ok: true, override: { effort: 'low' } })
+    await drain($.turn.step(step(3)))
+    expect(seen.steps.at(-1)).toEqual({ model: 'claude-haiku-5-5', effort: 'low', agentId: 'a1' })
+    expect(await steer($, { agent: 'nobody', op: 'stop' })).toMatchObject({ ok: false })
+    expect(await steer($, { agent: 'a1', op: 'dance' })).toMatchObject({ ok: false })
+  })
+
+  test('the model cannot call mcp__overseer__control', async ($, on) => {
+    world(on)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    const r = await $.tool.call({ tool: 'mcp__overseer__control', agent: 'a1', op: 'stop' } as never)
+    expect(JSON.stringify(r)).toContain('for other plugins')
   })
 
   test('/overseer off makes every hook pass straight through', async ($, on) => {

@@ -97,6 +97,24 @@ Under the hood Overseer runs `codex app-server` through a small POSIX `sh` bridg
 
 Each call of the Codex tool goes through your session's permissions first, like any other tool: an allow rule or a permissive mode runs it, a deny rule refuses it, and otherwise you're asked once per call. With no one to ask (a `-p` run in a mode that would prompt), the call is refused. To let it run unattended, allow `mcp__overseer__codex` in your permission settings. Two limits: `PreToolUse` command hooks in settings files don't see Codex tool calls (rules, the mode and plugin permission hooks do), and on a build without plugin permission checks (2.1.280) the Codex tool refuses to run.
 
+### For other plugins
+
+Another plugin in the session can steer an agent the way the pane does, with `mcp__overseer__control`:
+
+```ts
+const r = await $.tool.call({ tool: 'mcp__overseer__control', agent: 'counter', op: 'model', value: 'claude-sonnet-5-5' })
+// r.result is JSON: { ok: true, via, note } or { ok: false, reason }
+```
+
+- `agent` is the agent's id or name.
+- `op` is `send`, `model`, `effort`, `pause`, `resume` or `stop`. `value` is the message, model or effort; `default` gives back the agent's own model or effort.
+- Every change goes into the agent's record, so the pane shows it, just as a change made in the pane does.
+- A model or effort change reaches a Claude subagent at its next request. For a running Codex turn, Overseer does what **Apply now** does and says which way it went: `via: "turn/settings/update"` when Codex switched in place, `via: "turn/interrupt"` when Codex refused (it refuses some model switches mid-turn) and the turn stopped and continued on the new settings.
+- A message to a Claude subagent goes through `overseer-courier`, so Overseer still watches and steers the run it wakes. If the courier isn't running, the answer is `{ ok: false, code: "courier-missing" }`.
+- Codex agents can't be paused: Codex has no pause, only stopping the turn.
+
+The tool waits behind ToolSearch, and a call from the model itself is refused.
+
 ## Settings
 
 Change these in `/config` → overseer, or with `claude plugin configure overseer@overseer`.
@@ -128,6 +146,7 @@ Overseer uses Claude Code's function-hook plugin API (early access):
 | `session.send` / `session.receive` | Tracks the parent's messages and delivery of yours |
 | `ui.render` on `Pane` | The pane, one view for terminal, desktop, VS Code and mobile (mobile has buttons but no text fields or dropdowns) |
 | `ui.render` on `AbovePrompt` | The one-line band that reopens the pane |
+| `tool.call` on `mcp__overseer__control` | Steering from other plugins, through the pane's own actions |
 
 **Why two plugins:** a plugin never sees the requests of an agent its own call resumed. So Overseer queues your messages, and `overseer-courier` sends them from its own frame, as soon as Overseer writes the queue (a timer catches anything missed across a reload). That keeps Overseer able to watch and steer the agent your message woke up.
 

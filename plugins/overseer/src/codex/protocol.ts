@@ -20,7 +20,7 @@ export const QUIET_METHODS = [
   'account/updated',
 ]
 
-export const VERSION = '0.3.0'
+export const VERSION = '0.4.0'
 
 export const initialize = (id: number): Rpc =>
   req(id, 'initialize', {
